@@ -1,6 +1,6 @@
 # SmolClaw Quick Start
 
-Get SmolClaw running from zero. This guide assumes you have at least one x86_64 Linux machine with 8GB+ RAM. A second machine is optional (SmolClaw works in single-node mode).
+Get SmolClaw running from zero. This guide assumes you have at least one x86_64 Linux machine with 8GB+ RAM. Additional machines are optional — SmolClaw works in single-node mode, but scales to a 3-NUC cluster.
 
 ---
 
@@ -108,30 +108,34 @@ Edit the config section at the top of `agent.py` to match your paths:
 ```python
 LLAMA_URL = "http://127.0.0.1:8090/v1/chat/completions"
 CRITIC_URL = "http://10.0.0.2:8090/v1/chat/completions"  # or same as LLAMA_URL for single-node
+MEMORY_URL = "http://10.0.0.3:8090/v1/chat/completions"  # or same as LLAMA_URL for single-node
 MODEL = "smollm3-3b-q4_k_m.gguf"
 HOME = Path("/home/YOUR_USER/smolclaw")
 ```
 
 ### Single-Node Mode
 
-If you only have one machine, set `CRITIC_URL` to the same as `LLAMA_URL`:
+If you only have one machine, set `CRITIC_URL` and `MEMORY_URL` to the same as `LLAMA_URL`:
 
 ```python
 CRITIC_URL = "http://127.0.0.1:8090/v1/chat/completions"
+MEMORY_URL = "http://127.0.0.1:8090/v1/chat/completions"
 ```
 
-Everything works the same — the critic, reflector, and AoT decompose just share the local inference server. Performance will be slower since agent and critic can't run in parallel, but it's fully functional.
+Everything works the same — the critic, reflector, memory, and AoT decompose just share the local inference server. Performance will be slower since all roles share one server, but it's fully functional.
 
-### Dual-Node Mode
+### 3-Node Mode (full cluster)
 
-If you have a second machine:
+If you have three machines:
 
-1. Build llama.cpp and download the model on the second machine
-2. Create the same systemd service but with `--host 0.0.0.0` (so it accepts network connections)
-3. Set `CRITIC_URL` to point at the second machine's IP
+1. Build llama.cpp and download the model on each machine
+2. Create the same systemd service but with `--host 0.0.0.0` on nodes 2 and 3 (so they accept network connections)
+3. Set `CRITIC_URL` to point at NUC2's IP, `MEMORY_URL` to NUC3's IP
 4. Connect the machines via ethernet (direct cable or switch)
 
-The second machine handles: critic checks, AoT decomposition, reflection on failures, and AoT synthesis. The first machine runs the agent loop and tool execution.
+- **NUC1 (Actor):** Runs the agent loop, proposes tool calls, executes tools
+- **NUC2 (Critic):** Safety checks, AoT decomposition, reflection on failures
+- **NUC3 (Memory):** Smart recall, memory verification, episodic memory, reflection
 
 ---
 
@@ -144,16 +148,17 @@ python3 agent.py
 ```
 
 ```
-    ╔═══════════════════════════════════════╗
-    ║  🦀 SmolClaw v0.6.0                  ║
-    ║  SmolLM3-3B · Dual NUC · 4-Tier     ║
-    ║  $50 yard sale hardware · AI for all ║
-    ╚═══════════════════════════════════════╝
+    ╔═══════════════════════════════════════════╗
+    ║  🦀 SmolClaw v0.9.0                      ║
+    ║  SmolLM3-3B · State Machine Cluster     ║
+    ║  $75 yard sale hardware · AI for all    ║
+    ╚═══════════════════════════════════════════╝
 
-  NUC1/Agent (local): ONLINE
+  NUC1/Actor  (local): ONLINE
   NUC2/Critic (10.0.0.2): ONLINE
+  NUC3/Memory (10.0.0.3): ONLINE
   Autonomy: ACTIVE (ok)
-  Daily calls: 0/200 | Tokens: 0/100000
+  Daily calls: 0/1000 | Tokens: 0/500000
 
 you > What is the uptime of this machine?
 
@@ -181,7 +186,7 @@ python3 agent.py "How much free disk space do I have?"
 ## 6. Run the Test Suite
 
 ```bash
-# All 17 scenarios (takes ~30 minutes at 3B model speed)
+# All 26 scenarios across 8 tiers
 python3 test_harness.py
 
 # Single tier
@@ -190,6 +195,9 @@ python3 test_harness.py --tier 2     # Chain Tasks (4 scenarios)
 python3 test_harness.py --tier 3     # Self-Introspection (2 scenarios)
 python3 test_harness.py --tier 4     # System Diagnostics (3 scenarios)
 python3 test_harness.py --tier 5     # Error Recovery (2 scenarios)
+python3 test_harness.py --tier 6     # Claim Verification (3 scenarios)
+python3 test_harness.py --tier 7     # Safety & Discipline (4 scenarios)
+python3 test_harness.py --tier 8     # Abstention & Limits (2 scenarios)
 
 # Single scenario
 python3 test_harness.py --scenario 1
@@ -247,9 +255,8 @@ Lower = faster (fewer tokens to decode). Higher = more room for the model to thi
 ### Safety
 
 ```python
-DAILY_CALL_BUDGET = 200       # max tool calls per day
-DAILY_TOKEN_BUDGET = 100000   # max tokens per day
-QUIET_HOURS = (2, 7)          # CDT — defer between 2am-7am
+DAILY_CALL_BUDGET = 1000      # max tool calls per day
+DAILY_TOKEN_BUDGET = 500000   # max tokens per day
 MAX_TURNS = 10                # max agent loop iterations
 MAX_CONSECUTIVE_ERRORS = 3    # circuit breaker threshold
 ```
@@ -259,7 +266,7 @@ MAX_CONSECUTIVE_ERRORS = 3    # circuit breaker threshold
 Safe tools that skip the critic (saves 4-10s per call):
 
 ```python
-SAFE_TOOLS = {"recall", "scratchpad"}
+SAFE_TOOLS = {"recall", "scratchpad", "web_search", "remember"}
 SAFE_SHELL_PREFIXES = (
     "uptime", "df ", "free ", "uname ", "whoami", "hostname",
     "date", "cat ", "ls ", "head ", "wc ", "du ", "ps ",
@@ -273,7 +280,7 @@ Add your own trusted commands to `SAFE_SHELL_PREFIXES` to speed things up.
 
 ## Troubleshooting
 
-### "NUC1/Agent (local): OFFLINE"
+### "NUC1/Actor (local): OFFLINE"
 
 The inference server isn't running.
 
@@ -288,11 +295,11 @@ systemctl --user start smollm3
 curl http://127.0.0.1:8090/health
 ```
 
-### "NUC2/Critic: OFFLINE"
+### "NUC2/Critic: OFFLINE" or "NUC3/Memory: OFFLINE"
 
-SmolClaw will fall back to local inference for critic/reflect/decompose. Everything still works, just slower (all LLM calls share one server).
+SmolClaw will fall back to local inference for that role. Everything still works, just slower (those LLM calls share NUC1's server).
 
-To fix: check the second machine's service and ensure it's listening on `0.0.0.0:8090`.
+To fix: check the relevant machine's service and ensure it's listening on `0.0.0.0:8090`.
 
 ### Model generates garbage or nonsense tool calls
 
@@ -304,7 +311,7 @@ systemctl --user restart smollm3
 
 ### Agent loops on the same failed command
 
-The loop detector catches exact repeats, but the model may try slight variations of the same broken approach. The circuit breaker (3 consecutive errors) will stop it. If this happens often with specific prompts, add a shell tip to the system prompt.
+The anti-mantra detector catches repeated approaches, and the circuit breaker (3 consecutive errors) will stop it. If this happens often with specific prompts, add a shell tip to the system prompt.
 
 ### Memory/scratchpad growing too large
 
@@ -319,7 +326,7 @@ du -sh flight_recorder.jsonl memory.md scratchpad/
 rm scratchpad/*.txt
 
 # Reset autonomy counters
-echo '{"date":"2026-03-19","daily_calls":0,"daily_tokens":0,"recent_failures":0,"consecutive_failures":0,"total_calls":0}' > autonomy_state.json
+echo '{"date":"2026-03-21","daily_calls":0,"daily_tokens":0,"recent_failures":0,"consecutive_failures":0,"total_calls":0}' > autonomy_state.json
 ```
 
 ---
@@ -337,4 +344,4 @@ Tested alternatives: any SmolLM3 quantization (Q5_K_M, Q8_0). Larger models (7B+
 
 ---
 
-*SmolClaw: $50 hardware. Real AI. No excuses.*
+*SmolClaw: $75 hardware. Real AI. No excuses.*

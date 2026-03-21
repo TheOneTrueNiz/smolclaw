@@ -80,7 +80,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <div id="header">
-  <h1>SmolClaw v0.8.0</h1>
+  <h1>SmolClaw v0.9.0</h1>
   <span class="status">
     3-NUC Cognitive Cluster &middot;
     <span class="online">ONLINE</span>

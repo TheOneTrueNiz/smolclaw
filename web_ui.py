@@ -611,7 +611,7 @@ async function newChat() {
     const convo = await (await fetch('/api/conversations', {method:'POST'})).json();
     currentConvoId = convo.id;
     document.getElementById('messages').innerHTML =
-      '<div class="msg assistant">Hey, I\'m SmolClaw. I run on three NUCs and think with a 3B brain. Ask me anything.</div>';
+      '<div class="msg assistant">Hey, I am SmolClaw. I run on three NUCs and think with a 3B brain. Ask me anything.</div>';
     loadConversations();
     closeDrawers();
     document.getElementById('input').focus();
@@ -625,7 +625,7 @@ async function loadConvo(id) {
     currentConvoId = convo.id;
     const msgs = document.getElementById('messages');
     if (!convo.messages.length) {
-      msgs.innerHTML = '<div class="msg assistant">Hey, I\'m SmolClaw. I run on three NUCs and think with a 3B brain. Ask me anything.</div>';
+      msgs.innerHTML = '<div class="msg assistant">Hey, I am SmolClaw. I run on three NUCs and think with a 3B brain. Ask me anything.</div>';
     } else {
       msgs.innerHTML = convo.messages.map(m => `<div class="msg ${m.role}">${esc(m.content)}</div>`).join('');
     }

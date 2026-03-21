@@ -1,0 +1,22 @@
+# Secrets — NEVER commit API keys
+*.key
+*.secret
+secrets.env
+.env
+brave.key
+
+# Runtime state
+autonomy_state.json
+flight_recorder.jsonl
+episodic.jsonl
+scratchpad/
+critic_cache/
+logs/
+test_report.json
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store

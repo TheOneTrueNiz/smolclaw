@@ -1,3 +1,6 @@
+
+![Gemini_Generated_Image_o5m8d0o5m8d0o5m8](https://github.com/user-attachments/assets/5d1f9878-3aa4-4220-a92a-8cba98b23522)
+
 # SmolClaw
 
 **An autonomous AI agent running on $50 of yard sale hardware.**

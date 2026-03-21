@@ -13,6 +13,7 @@ scratchpad/
 critic_cache/
 logs/
 test_report.json
+conversations/
 
 # Python
 __pycache__/

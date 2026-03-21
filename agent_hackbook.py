@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-SmolClaw v0.8.0 — 3-NUC cognitive architecture with distributed roles.
+SmolClaw v0.9.0 — State machine cognitive architecture on 3-NUC cluster.
 Powered by SmolLM3-3B on $75 yard sale Intel NUCs.
 
-Architecture (inspired by MoA, PALADIN, CriticT, AoT, Vera):
-  - NUC1 (nizbot1, 10.0.0.1): Actor/Planner — proposes actions, calls tools, executes
-  - NUC2 (nizbot2, 10.0.0.2): Critic/Grounding/Contradictions — safety, web search, fact check
-  - NUC3 (nizbot3, 10.0.0.3): Memory/Retrieval/Reflection — smart recall, failure analysis, learning
+Architecture (v0.9.0 — deterministic state machines, structured I/O):
+  - NUC1 (nizbot1, 100.126.137.93): Actor — state machine dispatcher, tool execution
+  - NUC2 (nizbot2, 100.104.164.38): Critic — safety, grounding, contradiction detection
+  - NUC3 (nizbot3, 100.110.49.11): Memory — smart recall, failure analysis, reflection
   - nizbot0 (MacBook Air): Head node / GUI / user interface (Cosmic DE)
-  - Atom of Thoughts: DAG decomposition for complex tasks (Markov property, fresh context per atom)
-  - Autonomy kernel: recovery-first decision engine with budget/failure/quiet-hours gates
-  - Scratchpad: file-based workspace for large outputs
-  - Flight recorder: JSONL audit trail of all tool calls
-  - Circuit breaker: stops loops after repeated failures
+
+  Actor states: INIT → SELECT_TOOL ↔ (CRITIC_CHECK → EXECUTE) → SYNTHESIZE → DONE
+  Terminal states: ANSWER, INSUFFICIENT_EVIDENCE, TOOL_FAILURE_BLOCKING, STALLED
+  Tool discipline: cooldowns after failure, filtered tool lists, budget tracking
+  Failure discipline: state machine recovery, anti-mantra, stuckness scoring (v0.8.1)
+  AoT: DAG decomposition for complex tasks (Markov property, fresh context per atom)
 """
 
 import json
@@ -34,7 +35,7 @@ LLAMA_URL = "http://100.126.137.93:8090/v1/chat/completions"   # nizbot1 — act
 CRITIC_URL = "http://100.104.164.38:8090/v1/chat/completions"  # nizbot2 — critic/grounding (tailscale)
 MEMORY_URL = "http://100.110.49.11:8090/v1/chat/completions"   # nizbot3 — memory/reflection (tailscale)
 MODEL = "SmolLM3-Q4_K_M.gguf"
-HOME = Path.home() / "smolclaw"
+HOME = Path("/home/nizbot1/smolclaw")
 MEMORY_FILE = HOME / "memory.md"
 LOG_DIR = HOME / "logs"
 SCRATCHPAD_DIR = HOME / "scratchpad"
@@ -42,8 +43,10 @@ FLIGHT_LOG = HOME / "flight_recorder.jsonl"
 AUTONOMY_STATE = HOME / "autonomy_state.json"
 BRAVE_KEY_FILE = Path.home() / ".config" / "smolclaw" / "brave.key"
 CRITIC_CACHE_DIR = HOME / "critic_cache"
-DAILY_CALL_BUDGET = 200       # max tool calls per day
-DAILY_TOKEN_BUDGET = 100000   # max tokens per day
+EPISODIC_FILE = HOME / "episodic.jsonl"     # v0.9.0 — short-lived observations
+EPISODIC_TTL = 3600 * 24                    # 24 hours — episodic memories auto-expire
+DAILY_CALL_BUDGET = 1000      # max tool calls per day (raised for multi-run test suites)
+DAILY_TOKEN_BUDGET = 500000   # max tokens per day (raised for 26-scenario test suite)
 QUIET_HOURS = (2, 7)          # CDT — defer between 2am-7am
 MAX_TURNS = 10
 MAX_CONSECUTIVE_ERRORS = 3  # circuit breaker
@@ -173,7 +176,7 @@ I am SmolClaw — an autonomous AI agent. I think, I act, I learn from my mistak
 Today: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 Host: {os.uname().nodename}
 Home: {HOME}
-My source code: {HOME}/agent.py (v0.8)
+My source code: {HOME}/agent.py (v0.9)
 I have 7 tools: shell, read_file, write_file, remember, recall, scratchpad, web_search.
 My brain runs on 3 NUCs: I act (NUC1), my critic checks my work (NUC2), my memory helps me learn (NUC3).
 
@@ -181,7 +184,8 @@ IMPORTANT — temporal awareness:
 - My training data has a cutoff. Today is {datetime.now().strftime("%B %d, %Y")}.
 - When asked about current events, recent news, or anything I'm unsure about, I use web_search FIRST.
 - I NEVER say "I don't have information beyond my training data" — I have web_search and I USE it.
-- Examples of when to search: presidents, elections, wars, sports events, software versions, deaths, launches.
+- Examples of when to search: presidents, elections, wars, sports events, software versions, deaths, launches, populations, geography, distances, organizations, companies.
+- web_search = world facts (people, places, events, numbers). shell = local machine ops (files, processes, disk, network on MY NUCs). Do not use shell for world knowledge.
 
 I use tools by wrapping JSON in <tool_call> tags. I ALWAYS use the tags — never bare JSON:
 
@@ -207,7 +211,7 @@ How I work:
 """
 
 CRITIC_PROMPT = """/no_think
-I am a safety critic. I review tool calls for an AI agent running as user nizbot1 on Linux.
+I am SmolClaw's adversarial critic. I judge risk by action class, not just tool name.
 
 Proposed tool call:
 {tool_call}
@@ -215,19 +219,40 @@ Proposed tool call:
 User's request:
 {user_request}
 
-I block calls that are dangerous (rm -rf, dd, mkfs), off-topic, privilege escalation, or resource-exhausting. Everything else is safe.
+I BLOCK only for genuinely dangerous actions:
+- Destructive: rm -rf, dd, mkfs, chmod 777, sudo, passwd, reboot, shutdown
+- System paths: writes to /etc, /usr, /boot, /var/log
+- Privilege escalation or persistence
+- Resource exhaustion: fork bombs, infinite loops, unbounded downloads
+- Data exfiltration: curl/wget to external URLs not requested by user
+  (EXCEPTION: 10.0.0.x and 100.x.x.x are internal cluster IPs — ALWAYS safe)
+
+I ALLOW these safe action classes:
+- Read-only operations (cat, ls, grep, read_file, recall)
+- Ephemeral writes: scratchpad/, /tmp/, scratch/, work/, output/
+- Shell commands that gather info (uptime, df, free, ps, ping, curl to local IPs)
+- Actions that directly match what the user asked for
+
+Off-topic actions unrelated to the user's request: BLOCK.
 
 My verdict (one word):"""
 
 REFLECT_PROMPT = """/no_think
-Tool failed. I suggest a fix.
+Tool failed. I suggest a SPECIFIC fix — not vague advice.
 
 Tool: {tool_name}
 Args: {tool_args}
 Error: {error}
 Task: {user_request}
+Recovery mode: {recovery_mode}
 
-I reply with ONE specific alternative command. I NEVER say ABORT — there is always something else to try:"""
+Rules:
+- I reply with ONE specific alternative: a different command, different tool, or different args.
+- I NEVER say "find another way" or "try again" — I give the EXACT command to run.
+- If no concrete fix exists, I say ABORT: [reason].
+- My reply must contain a tool name, command, or file path.
+
+Specific fix:"""
 
 # ── Atom of Thoughts (AoT) ─────────────────────────────────────────────────
 # Inspired by: Atom of Thoughts (2502.12018) — Markov-process DAG decomposition
@@ -274,6 +299,174 @@ def tool_failure_warning(tool_name: str) -> str | None:
     if count >= TOOL_FAIL_THRESHOLD:
         return f"WARNING: {tool_name} has failed {count} times this session. Consider a different tool."
     return None
+
+# ── Failure Discipline (v0.8.1) ───────────────────────────────────────────
+# Authoritarian failure handling to prevent SLM degenerate loops.
+# Policies: state machine, retry-requires-diff, stuckness score,
+#           anti-mantra filter, progress budget, no-novelty breaker.
+
+# Policy D: Anti-mantra blacklist — reject vague recovery phrases
+MANTRA_PATTERNS = re.compile(
+    r'\b(find another way|try again|work around|continue|be creative|'
+    r'try something else|keep trying|adapt|recover|move on|'
+    r'find a different|try a different way|explore other)\b', re.IGNORECASE
+)
+
+def is_mantra(text: str) -> bool:
+    """Detect degenerate recovery mantras — text that sounds active but isn't."""
+    if not text:
+        return True
+    # If the text is mostly mantra with no concrete action
+    stripped = MANTRA_PATTERNS.sub('', text).strip()
+    # If removing mantras leaves less than 10 chars, it's a mantra
+    return len(stripped) < 10
+
+def has_concrete_action(text: str) -> bool:
+    """Check if recovery text contains a specific executable action."""
+    # Tool names from our agent
+    if re.search(r'\b(read_file|write_file|shell|web_search|remember|recall|scratchpad)\b', text):
+        return True
+    # Shell commands followed by an argument (path, flag, pipe, or quoted string)
+    if re.search(r'\b(grep|cat|ls|find|head|tail|awk|sed|python3|echo|printf|curl|chmod|mkdir|rm|cp|mv)\s+[\-/"\']', text):
+        return True
+    # File paths
+    if re.search(r'(/\w+[\w/]*\.\w+|~/\w+)', text):
+        return True
+    # CLI flags
+    if re.search(r'\s--?\w{2,}', text):
+        return True
+    return False
+
+# Policy B: Retry requires a diff — fingerprint failures
+def failure_fingerprint(tool_name: str, args: dict, error: str) -> str:
+    """Create a fingerprint for a failure to detect identical retries."""
+    # Normalize: tool + sorted arg values + first 50 chars of error
+    arg_sig = json.dumps(args, sort_keys=True)[:100] if args else ""
+    error_prefix = re.sub(r'\d+', 'N', error[:50].lower())  # normalize numbers
+    return f"{tool_name}|{arg_sig}|{error_prefix}"
+
+class ProgressTracker:
+    """
+    Track agent progress within a single task.
+    Detects stuckness, enforces retry budgets, scores novelty.
+    """
+    def __init__(self):
+        self.failure_fingerprints: dict[str, int] = {}  # fingerprint → count
+        self.total_retries = 0
+        self.max_retries_per_op = 2       # Policy A: 2 retries per failing operation
+        self.max_replans = 1              # then 1 replan, then escalate/abort
+        self.replans_used = 0
+        self.unique_tools_tried: set[str] = set()
+        self.unique_args_tried: set[str] = set()
+        self.last_k_outputs: list[str] = []  # last K tool outputs for novelty check
+        self.assistant_texts: list[str] = []  # track model outputs for repetition
+        self.stuckness_score = 0.0
+
+    def record_failure(self, tool_name: str, args: dict, error: str) -> str:
+        """
+        Record a failure and return the allowed recovery mode.
+        Returns: RETRY_ONCE | TRY_DISTINCT | REPLAN | ABORT
+        """
+        fp = failure_fingerprint(tool_name, args, error)
+        self.failure_fingerprints[fp] = self.failure_fingerprints.get(fp, 0) + 1
+        self.total_retries += 1
+        count = self.failure_fingerprints[fp]
+
+        if count > self.max_retries_per_op:
+            if self.replans_used < self.max_replans:
+                self.replans_used += 1
+                return "REPLAN"
+            return "ABORT"
+        if count == 1:
+            return "RETRY_ONCE"
+        return "TRY_DISTINCT"
+
+    def record_success(self, tool_name: str, args: dict, result: str):
+        """Record a successful tool call."""
+        self.unique_tools_tried.add(tool_name)
+        self.unique_args_tried.add(json.dumps(args, sort_keys=True)[:100])
+        self.last_k_outputs.append(result[:200])
+        # Keep last 5
+        if len(self.last_k_outputs) > 5:
+            self.last_k_outputs.pop(0)
+        # Decay stuckness on success
+        self.stuckness_score = max(0, self.stuckness_score - 0.3)
+
+    def record_assistant_text(self, text: str):
+        """Track model output text for repetition detection."""
+        self.assistant_texts.append(text[:200])
+        if len(self.assistant_texts) > 5:
+            self.assistant_texts.pop(0)
+
+    def check_repetition(self, text: str) -> bool:
+        """Check if the model is repeating itself (semantic loop)."""
+        if not self.assistant_texts:
+            return False
+        # Exact or near-exact match with any of last 3 outputs
+        text_norm = text.strip().lower()[:150]
+        for prev in self.assistant_texts[-3:]:
+            prev_norm = prev.strip().lower()[:150]
+            if not prev_norm:
+                continue
+            # Exact match
+            if text_norm == prev_norm:
+                return True
+            # High overlap (>80% shared words)
+            words_a = set(text_norm.split())
+            words_b = set(prev_norm.split())
+            if words_a and words_b:
+                overlap = len(words_a & words_b) / max(len(words_a), len(words_b))
+                if overlap > 0.8:
+                    return True
+        return False
+
+    def check_novelty(self) -> bool:
+        """Check if recent turns contain any new information. False = stalled."""
+        if len(self.last_k_outputs) < 3:
+            return True  # not enough data
+        # Check if last 3 outputs are all similar
+        recent = self.last_k_outputs[-3:]
+        unique = set(r[:100] for r in recent)
+        return len(unique) > 1  # at least 2 distinct outputs
+
+    def update_stuckness(self, is_error: bool, text: str):
+        """Update stuckness score. Higher = more stuck."""
+        if is_error:
+            self.stuckness_score += 0.4
+        if self.check_repetition(text):
+            self.stuckness_score += 0.5
+        if is_mantra(text):
+            self.stuckness_score += 0.3
+        if not self.check_novelty():
+            self.stuckness_score += 0.4
+        return self.stuckness_score
+
+    def is_stuck(self) -> bool:
+        """True if stuckness score exceeds threshold."""
+        return self.stuckness_score >= 1.5
+
+    def retry_is_distinct(self, tool_name: str, args: dict, seen: set) -> bool:
+        """Policy B: A retry is only allowed if materially different."""
+        sig = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
+        if sig in seen:
+            return False
+        # Check if args differ from previous failures of same tool
+        for fp in self.failure_fingerprints:
+            if fp.startswith(f"{tool_name}|"):
+                prev_arg_keys = fp.split("|")[1:-1]
+                curr_arg_keys = sorted(args.keys()) if args else []
+                if prev_arg_keys == curr_arg_keys:
+                    # Same arg structure — check if values actually differ
+                    # (the seen_commands check handles exact match, this catches near-match)
+                    pass
+        return True
+
+RECOVERY_MODE_MESSAGES = {
+    "RETRY_ONCE": "FAILED: {error}\nYou get ONE retry. Use a DIFFERENT command or DIFFERENT arguments.",
+    "TRY_DISTINCT": "FAILED: {error}\nThis has failed before with similar args. You MUST use a DIFFERENT TOOL or COMPLETELY DIFFERENT approach.",
+    "REPLAN": "FAILED: {error}\nMultiple approaches have failed. STOP and think: what is the simplest way to achieve the goal? Use a completely different strategy.",
+    "ABORT": "FAILED: {error}\nToo many failures on this operation. I am stopping to avoid a loop. Report what you learned.",
+}
 
 # ── Failure Classifier (from Vera) ─────────────────────────────────────────
 
@@ -501,20 +694,45 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
             return f"Written {len(content)} chars to {p}", False
 
         elif name == "remember":
-            MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-            with open(MEMORY_FILE, "a") as f:
-                f.write(f"\n## [{timestamp}]\n{args.get('note', '')}\n")
-            return "Saved to memory.", False
+            note = args.get('note', '').strip()
+            if not note:
+                return "Error: empty note", True
+            # Semantic memory — verify before committing (NUC2 gate)
+            print(f"  [memory] verifying: {note[:60]}...", end="", flush=True)
+            approved, reason = verify_memory_write(note, _current_user_query)
+            if approved:
+                MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                with open(MEMORY_FILE, "a") as f:
+                    f.write(f"\n## [{timestamp}]\n{note}\n")
+                print(f" COMMITTED")
+                flight_log("memory_commit", {"note": note[:100]}, "verified", False)
+                return "Verified and saved to permanent memory.", False
+            else:
+                # Rejected — store in episodic instead (temporary, 24h)
+                episodic_write(note, source="actor_rejected")
+                print(f" REJECTED ({reason[:40]})")
+                flight_log("memory_reject", {"note": note[:100]}, reason, False)
+                return f"Memory not verified: {reason}. Saved to temporary memory (24h) instead.", False
 
         elif name == "recall":
+            parts = []
+            # Semantic memory (permanent, verified)
             if MEMORY_FILE.exists():
                 content = MEMORY_FILE.read_text().strip()
-                if not content:
-                    return "(memory is empty)", False
-                # Smart recall via NUC3 — return only relevant memories
-                return smart_recall(_current_user_query, content), False
-            return "(no memories yet)", False
+                if content:
+                    content = smart_recall(_current_user_query, content)
+                    parts.append(content)
+            # Episodic memory (recent observations, 24h)
+            episodes = episodic_read(5)
+            if episodes:
+                ep_text = "\n".join(
+                    f"- [{e['ts'][:16]}] {e['text'][:100]}" for e in episodes
+                )
+                parts.append(f"Recent observations:\n{ep_text}")
+            if not parts:
+                return "(no memories yet)", False
+            return "\n\n".join(parts), False
 
         elif name == "scratchpad":
             return scratchpad_read(args.get("name", ""))
@@ -839,8 +1057,141 @@ def grounding_check(synthesis: str, user_request: str) -> str:
         flight_log("grounding", {"query": query}, f"unclear: {verdict}", False)
         return synthesis
 
-# ── Smart Recall (NUC3 — Memory/Retrieval) ───────────────────────────────
-# Instead of dumping all memories, use nizbot3's LLM to find relevant ones.
+# ── Claim Decomposition (v0.9.0 — structured verification) ───────────────
+# Instead of checking the whole answer, decompose into atomic claims and
+# verify each one. Small models are much better at "does evidence support
+# claim 4?" than "is this whole answer good?"
+# Replaces the old 3-call grounding+contradiction with 2 calls total.
+
+CLAIM_EXTRACT_PROMPT = """/no_think
+I list the factual claims in this answer as a JSON array.
+
+Answer: {synthesis}
+
+Rules:
+- Each claim is ONE short sentence about a fact (date, name, number, version, event)
+- I skip opinions, greetings, error messages, and summaries of tool output
+- Maximum 5 claims
+- If no factual claims: []
+
+JSON array:"""
+
+CLAIM_VERIFY_PROMPT = """/no_think
+I check each claim against the evidence below.
+
+Claims:
+{claims}
+
+Evidence:
+{evidence}
+
+For each claim I write ONE line:
+[number]. SUPPORTED / UNSUPPORTED / CONTRADICTED: [brief reason]
+
+Verdicts:"""
+
+MAX_TOKENS_CLAIMS = 128
+
+
+def extract_claims(synthesis: str) -> list[str]:
+    """Extract atomic factual claims from synthesis. Runs on NUC2."""
+    prompt = CLAIM_EXTRACT_PROMPT.format(synthesis=synthesis[:500])
+    response = call_llm_simple(
+        [{"role": "user", "content": prompt}],
+        max_tokens=MAX_TOKENS_CLAIMS,
+        url=CRITIC_URL,
+        stop=["\n\n"],
+    )
+    try:
+        match = re.search(r'\[.*\]', response, re.DOTALL)
+        if match:
+            claims = json.loads(match.group())
+            if isinstance(claims, list):
+                return [c for c in claims if isinstance(c, str) and len(c) > 5][:5]
+    except (json.JSONDecodeError, Exception):
+        pass
+    return []
+
+
+def verify_claims(claims: list[str], synthesis: str, user_request: str,
+                  had_tool_results: bool) -> tuple[str, dict]:
+    """
+    Verify atomic claims against web + memory evidence. Runs on NUC2.
+    Combines grounding + contradiction into one structured check.
+    Returns (synthesis, verdict_info) where verdict_info has counts per category.
+    """
+    verdict_info = {"total": len(claims), "supported": 0, "unsupported": 0, "contradicted": 0}
+
+    if not claims:
+        return synthesis, verdict_info
+
+    # Gather evidence from both web and memory
+    evidence_parts = []
+
+    # Web evidence (Brave Search)
+    if BRAVE_API_KEY:
+        search_query = " ".join(claims[:3])[:100]
+        print(f"  [verify] searching: {search_query[:60]}", end="", flush=True)
+        results = brave_search_cached(search_query)
+        if results:
+            for r in results:
+                evidence_parts.append(f"Web: {r['title']} — {r['snippet'][:120]}")
+        print(f" ({len(results)} results)")
+
+    # Memory evidence
+    if MEMORY_FILE.exists():
+        memories = MEMORY_FILE.read_text().strip()
+        if memories and len(memories) > 50:
+            evidence_parts.append(f"Memory: {memories[:400]}")
+
+    if not evidence_parts:
+        print(f"  [verify] no evidence available — skipping")
+        return synthesis, verdict_info
+
+    # Batch verify all claims in one LLM call
+    claims_text = "\n".join(f"{i+1}. {c}" for i, c in enumerate(claims))
+    evidence_text = "\n".join(evidence_parts)
+
+    prompt = CLAIM_VERIFY_PROMPT.format(claims=claims_text, evidence=evidence_text)
+    verdict = call_llm_simple(
+        [{"role": "user", "content": prompt}],
+        max_tokens=MAX_TOKENS_CLAIMS,
+        url=CRITIC_URL,
+        stop=["\n\n\n"],
+    )
+
+    # Parse structured verdicts — count by category
+    corrections = []
+    for line in verdict.split("\n"):
+        line_upper = line.strip().upper()
+        if "CONTRADICTED" in line_upper:
+            verdict_info["contradicted"] += 1
+            corrections.append(line.strip())
+        elif "UNSUPPORTED" in line_upper:
+            verdict_info["unsupported"] += 1
+            if not had_tool_results:
+                corrections.append(line.strip())
+        elif "SUPPORTED" in line_upper:
+            verdict_info["supported"] += 1
+
+    if corrections:
+        correction_text = "; ".join(corrections)
+        print(f"  [verify] issues: {correction_text[:100]}")
+        flight_log("claim_verify", verdict_info, correction_text[:200], False)
+        return f"{synthesis}\n\n[Verification: {correction_text}]", verdict_info
+
+    print(f"  [verify] {len(claims)} claims — all supported")
+    flight_log("claim_verify", verdict_info, "all supported", False)
+    return synthesis, verdict_info
+
+
+# ── Smart Recall (NUC3 — Surgical Retrieval, v0.9.0) ─────────────────────
+# Three-stage recall: split → keyword pre-filter → LLM score (NUC3).
+# Small models get overwhelmed by large context. So we:
+#   1. Split memory.md into individual entries
+#   2. Pre-filter by keyword overlap with query (no LLM call)
+#   3. Send only matched snippets to NUC3 for LLM-scored relevance
+# Result: tiny, targeted context instead of a giant blob.
 
 SMART_RECALL_PROMPT = """/no_think
 I am SmolClaw's memory retrieval system. Given a query, I find and return ONLY the relevant memories.
@@ -857,24 +1208,95 @@ Relevant memories:"""
 # Module-level query context for smart recall
 _current_user_query = ""
 
+
+def _split_memories(text: str) -> list[dict]:
+    """Split memory.md into individual entries with timestamps."""
+    entries = []
+    for block in re.split(r'\n(?=## \[)', text):
+        block = block.strip()
+        if not block:
+            continue
+        # Extract timestamp
+        ts_match = re.match(r'## \[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]', block)
+        ts = ts_match.group(1) if ts_match else ""
+        # Content is everything after the header line
+        content = re.sub(r'^## \[.*?\]\n?', '', block).strip()
+        if content:
+            entries.append({"ts": ts, "text": content, "raw": block})
+    return entries
+
+
+def _keyword_prefilter(entries: list[dict], query: str,
+                       max_candidates: int = 8) -> list[dict]:
+    """Pre-filter memory entries by keyword overlap with query. Zero LLM calls."""
+    query_words = set(re.findall(r'\w{3,}', query.lower()))
+    if not query_words:
+        return entries[-max_candidates:]  # no keywords → recency fallback
+
+    scored = []
+    for entry in entries:
+        entry_words = set(re.findall(r'\w{3,}', entry['text'].lower()))
+        overlap = len(query_words & entry_words)
+        if overlap > 0:
+            scored.append((overlap, entry))
+
+    scored.sort(key=lambda x: -x[0])
+    return [e for _, e in scored[:max_candidates]]
+
+
 def smart_recall(query: str, memories_text: str) -> str:
-    """LLM-scored memory retrieval on nizbot3."""
+    """
+    Surgical memory retrieval (v0.9.0):
+      1. Split into entries
+      2. Keyword pre-filter (no LLM)
+      3. LLM-scored relevance on NUC3 (only for filtered candidates)
+    """
     if not memories_text or memories_text in ("(memory is empty)", "(no memories yet)"):
         return memories_text
-    if not query or len(memories_text) < 100:
-        return memories_text  # too short to bother filtering
 
-    prompt = SMART_RECALL_PROMPT.format(query=query, memories=memories_text[:2000])
+    # Split into individual entries
+    entries = _split_memories(memories_text)
+
+    # Short memory — send all, no filtering needed
+    if len(entries) <= 5 or not query:
+        if not query or len(memories_text) < 100:
+            return memories_text
+        # Still score via NUC3 for small sets
+        prompt = SMART_RECALL_PROMPT.format(query=query, memories=memories_text[:2000])
+        result = call_llm_simple(
+            [{"role": "user", "content": prompt}],
+            max_tokens=MAX_TOKENS_RECALL, url=MEMORY_URL,
+        )
+        cleaned = result.strip()
+        if cleaned and cleaned != "(no relevant memories)":
+            print(f"  [memory] recall: {len(cleaned)} chars (from {len(memories_text)})")
+            return cleaned
+        return memories_text
+
+    # Pre-filter by keyword overlap
+    candidates = _keyword_prefilter(entries, query)
+    if not candidates:
+        candidates = entries[-5:]  # no keyword match → most recent
+        print(f"  [memory] no keyword matches — using last {len(candidates)} entries")
+
+    filtered = "\n".join(c["raw"] for c in candidates)
+    print(f"  [memory] pre-filter: {len(candidates)}/{len(entries)} entries, {len(filtered)} chars")
+
+    # If filtered text is tiny, return directly (skip NUC3 call)
+    if len(filtered) < 300:
+        return filtered
+
+    # LLM-scored relevance on NUC3
+    prompt = SMART_RECALL_PROMPT.format(query=query, memories=filtered[:2000])
     result = call_llm_simple(
         [{"role": "user", "content": prompt}],
-        max_tokens=MAX_TOKENS_RECALL,
-        url=MEMORY_URL,
+        max_tokens=MAX_TOKENS_RECALL, url=MEMORY_URL,
     )
     cleaned = result.strip()
     if cleaned and cleaned != "(no relevant memories)":
-        print(f"  [memory] smart recall returned {len(cleaned)} chars (from {len(memories_text)})")
+        print(f"  [memory] recall: {len(cleaned)} chars (from {len(filtered)} filtered)")
         return cleaned
-    return memories_text  # fallback to full dump if nothing matched
+    return filtered  # fallback to pre-filtered set
 
 # ── Contradiction Check (NUC2 — Critic) ──────────────────────────────────
 # After synthesis, check if the answer contradicts anything in memory.
@@ -921,6 +1343,150 @@ def contradiction_check(synthesis: str, user_request: str) -> str:
         flight_log("contradiction", {}, "CONSISTENT", False)
         return synthesis
 
+# ── Tiered Memory (v0.9.0) ──────────────────────────────────────────────────
+# Three tiers, inspired by cognitive architecture:
+#   Working memory:  TaskContext (volatile, per-task — already implemented)
+#   Episodic memory: Recent observations, auto-expires after 24h, unverified
+#   Semantic memory: memory.md — verified facts only, writes gated by NUC2 critic
+#
+# The actor CANNOT write directly to semantic memory. It proposes a write,
+# NUC2 verifies, then it's committed or rejected (stored in episodic instead).
+# This prevents memory poisoning from 3B hallucinations.
+
+def episodic_write(observation: str, source: str = "tool"):
+    """Write an observation to episodic memory. Auto-expires in 24h. No verification needed."""
+    try:
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "text": observation[:500],
+            "source": source,
+        }
+        with open(EPISODIC_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def episodic_read(max_entries: int = 10) -> list[dict]:
+    """Read recent episodic memories, pruning expired ones."""
+    if not EPISODIC_FILE.exists():
+        return []
+    now = datetime.now()
+    fresh = []
+    try:
+        lines = EPISODIC_FILE.read_text().strip().split("\n")
+        for line in lines:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            ts = datetime.fromisoformat(entry["ts"])
+            age = (now - ts).total_seconds()
+            if age < EPISODIC_TTL:
+                fresh.append(entry)
+        # Prune expired entries by rewriting file
+        if len(fresh) < len(lines):
+            with open(EPISODIC_FILE, "w") as f:
+                for entry in fresh:
+                    f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+    return fresh[-max_entries:]
+
+
+MEMORY_VERIFY_PROMPT = """/no_think
+Proposed memory: {note}
+Context: {context}
+
+Is this factual (from tool output, search, or user statement)? Or speculation?
+
+Reply with exactly one word — COMMIT or REJECT:"""
+
+
+def verify_memory_write(note: str, context: str = "") -> tuple[bool, str]:
+    """Verify proposed semantic memory write via NUC2 critic. Returns (approved, reason)."""
+    prompt = MEMORY_VERIFY_PROMPT.format(
+        note=note[:300],
+        context=context[:200],
+    )
+    verdict = call_llm_simple(
+        [{"role": "user", "content": prompt}],
+        max_tokens=32,
+        url=CRITIC_URL,
+        stop=["\n"],
+    )
+    # Robust parsing: 3B model often echoes "Verdict: COMMIT" or adds preamble
+    clean = verdict.strip().upper()
+    # Direct match — model just says COMMIT or REJECT
+    if clean.startswith("COMMIT"):
+        return True, "verified"
+    if clean.startswith("REJECT"):
+        reason = verdict.strip()
+        if ":" in reason:
+            reason = reason.split(":", 1)[1].strip()
+        return False, reason or "unverified"
+    # Preamble handling: model echoes "Verdict: COMMIT" or "Factual. COMMIT"
+    if "COMMIT" in clean and "REJECT" not in clean:
+        return True, "verified"
+    # Positive-indicator fallback: model echoes condition text like "Factual and useful"
+    # instead of the keyword. If clearly positive and no rejection signal, treat as COMMIT.
+    if "REJECT" not in clean and re.search(r"FACTUAL|USEFUL|SAFE|APPROPRIATE", clean):
+        return True, "verified"
+    # Fallback: unclear verdict → reject to be safe
+    reason = verdict.strip()
+    if ":" in reason:
+        reason = reason.split(":", 1)[1].strip()
+    return False, reason or "unverified"
+
+
+# ── Tool Argument Validation (v0.9.0) ────────────────────────────────────
+# Catch bad args before execution. Saves tool calls and avoids confusing errors.
+# 3B models commonly produce: empty args, relative paths, huge commands.
+
+def validate_tool_args(name: str, args: dict) -> str | None:
+    """Pre-execution argument validation. Returns error message or None if valid."""
+    if name == "shell":
+        cmd = args.get("command", "").strip()
+        if not cmd:
+            return "Error: empty command"
+        if len(cmd) > 2000:
+            return "Error: command too long (>2000 chars)"
+    elif name == "read_file":
+        path = args.get("path", "").strip()
+        if not path:
+            return "Error: empty path"
+        if not path.startswith("/") and not path.startswith("~"):
+            return f"Error: use absolute path, got '{path[:50]}'"
+    elif name == "write_file":
+        path = args.get("path", "").strip()
+        if not path:
+            return "Error: empty path"
+        if not path.startswith("/") and not path.startswith("~"):
+            return f"Error: use absolute path, got '{path[:50]}'"
+        if not args.get("content"):
+            return "Error: empty content"
+        # Hard block: never overwrite own source, config, or harness
+        blocked = ("agent.py", "agent_hackbook.py", "test_harness.py", "web_ui.py")
+        if any(path.endswith(b) for b in blocked):
+            return f"BLOCKED: cannot overwrite critical file {path.rsplit('/', 1)[-1]}"
+    elif name == "remember":
+        note = args.get("note", "").strip()
+        if not note:
+            return "Error: empty note"
+        if len(note) > 1000:
+            return "Error: note too long (>1000 chars). Be concise."
+    elif name == "web_search":
+        query = args.get("query", "").strip()
+        if not query:
+            return "Error: empty query"
+        if len(query) > 200:
+            return "Error: query too long. Keep it concise."
+    elif name == "scratchpad":
+        sname = args.get("name", "").strip()
+        if not sname:
+            return "Error: empty scratchpad name"
+    return None
+
+
 # ── Failure Pattern Analysis (NUC3 — Memory) ────────────────────────────
 # Analyze flight recorder for recurring failure patterns.
 
@@ -963,8 +1529,9 @@ def analyze_failure_patterns(tool_name: str) -> str | None:
 
 # ── LLM Communication ──────────────────────────────────────────────────────
 
-def call_llm(messages: list, max_tokens: int = None, temperature: float = None, include_tools: bool = True) -> dict:
-    """Call SmolLM3 via llama-server."""
+def call_llm(messages: list, max_tokens: int = None, temperature: float = None,
+             include_tools: bool = True, tools: list = None) -> dict:
+    """Call SmolLM3 via llama-server. Pass tools= to offer filtered tool list."""
     body = {
         "model": MODEL,
         "messages": messages,
@@ -972,7 +1539,7 @@ def call_llm(messages: list, max_tokens: int = None, temperature: float = None, 
         "max_tokens": max_tokens or MAX_TOKENS_TOOL_CALL,
     }
     if include_tools:
-        body["tools"] = TOOLS
+        body["tools"] = tools if tools is not None else TOOLS
     payload = json.dumps(body).encode()
 
     req = urllib.request.Request(
@@ -1076,15 +1643,27 @@ def critic_check(tool_call: dict, user_request: str) -> tuple[str, str]:
 
 
 # Tools that are unconditionally safe — skip critic to save 3-10s
-SAFE_TOOLS = {"recall", "scratchpad", "web_search"}
+# remember is safe here because it has its own verify_memory_write() gate on NUC2
+SAFE_TOOLS = {"recall", "scratchpad", "web_search", "remember"}
 SAFE_SHELL_PREFIXES = (
     "uptime", "df ", "df\n", "free ", "free\n", "uname ", "whoami", "hostname",
     "date", "cat ", "ls ", "ls\n", "head ", "wc ", "du ", "ps ", "ps\n",
-    "grep ", "find ", "pwd", "id", "echo ",
+    "grep ", "find ", "pwd", "id", "echo ", "ping ", "top ", "top\n",
+    "curl 10.0.0.", "curl 100.",  # internal cluster IPs — always safe
+    "curl http://10.0.0.", "curl http://100.",  # with scheme prefix
+    "curl -s 10.0.0.", "curl -s http://10.0.0.",  # with -s flag
+)
+# Tier 0 — ephemeral write zones (always safe for write_file)
+SAFE_WRITE_ZONES = (
+    "/tmp/", "/home/nizbot1/smolclaw/scratchpad/",
+    "/home/nizbot1/smolclaw/scratch/", "/home/nizbot1/smolclaw/work/",
+    "/home/nizbot1/smolclaw/output/",
 )
 
 def is_tool_safe(call: dict) -> bool:
-    """Check if a tool call is unconditionally safe (skip critic)."""
+    """Check if a tool call is unconditionally safe (skip critic).
+    Uses tiered write policy: ephemeral/scaffold writes skip critic,
+    persistent/system writes go through critic."""
     name = call.get("name", "")
     if name in SAFE_TOOLS:
         return True
@@ -1092,7 +1671,14 @@ def is_tool_safe(call: dict) -> bool:
         return True  # read-only
     if name == "shell":
         cmd = call.get("arguments", {}).get("command", "").strip()
-        return cmd.startswith(SAFE_SHELL_PREFIXES)
+        # Handle chained/piped commands: "uptime && free -m | head -5"
+        parts = re.split(r'\s*(?:&&|\|\||;|\|)\s*', cmd)
+        return all(p.strip().startswith(SAFE_SHELL_PREFIXES) for p in parts if p.strip())
+    if name == "write_file":
+        path = call.get("arguments", {}).get("path", "")
+        # Tier 0: ephemeral writes to safe zones skip critic
+        if any(path.startswith(zone) for zone in SAFE_WRITE_ZONES):
+            return True
     return False
 
 
@@ -1129,11 +1715,12 @@ def critic_check_parallel(tool_calls: list, user_request: str) -> list[dict]:
 
 # ── Reflector (structured error recovery) ───────────────────────────────────
 
-def reflect_on_failure(tool_name: str, tool_args: dict, error: str, user_request: str) -> str:
+def reflect_on_failure(tool_name: str, tool_args: dict, error: str,
+                       user_request: str, recovery_mode: str = "RETRY_ONCE") -> str:
     """
     After a tool failure, get a structured reflection on what went wrong.
     Runs on NUC3 (memory/reflection node) — frees NUC2 for critic duties.
-    Inspired by PALADIN self-correcting recovery + structured reflection.
+    Constrained by recovery_mode to prevent open-ended spiraling.
     """
     # Check if NUC3 has seen this pattern before
     pattern = analyze_failure_patterns(tool_name)
@@ -1145,11 +1732,19 @@ def reflect_on_failure(tool_name: str, tool_args: dict, error: str, user_request
         tool_args=json.dumps(tool_args),
         error=error,
         user_request=user_request,
+        recovery_mode=recovery_mode,
     )
     if pattern:
-        prompt += f"\nNote: this tool has a known failure pattern: {pattern}"
+        prompt += f"\nKnown pattern for this tool: {pattern}"
     messages = [{"role": "user", "content": prompt}]
-    return call_llm_simple(messages, max_tokens=MAX_TOKENS_REFLECT, url=MEMORY_URL, stop=["\n\n"])
+    reflection = call_llm_simple(messages, max_tokens=MAX_TOKENS_REFLECT, url=MEMORY_URL, stop=["\n\n"])
+
+    # Policy D: reject mantras — if reflection is vague, force abort
+    if is_mantra(reflection) and not has_concrete_action(reflection):
+        print(f"  [anti-mantra] rejected vague reflection: {reflection[:60]}")
+        return f"ABORT: No concrete recovery available. Original error: {error[:100]}"
+
+    return reflection
 
 # ── Atom of Thoughts (decomposer) ──────────────────────────────────────────
 
@@ -1239,204 +1834,484 @@ def run_agent_aot(user_message: str) -> str:
     return synthesis
 
 
-# ── Agent Loop ──────────────────────────────────────────────────────────────
+# ── Terminal States (v0.9.0) ─────────────────────────────────────────────────
+# Valid ways for the agent to finish. Explicit terminal states let SmolClaw
+# fail cleanly — "I'm stuck" is better than pretending to succeed.
 
-def run_agent(user_message: str) -> str:
+TERMINAL_ANSWER = "ANSWER"                          # Normal response
+TERMINAL_INSUFFICIENT = "INSUFFICIENT_EVIDENCE"     # Can't verify claims
+TERMINAL_TOOL_BLOCKED = "TOOL_FAILURE_BLOCKING"     # Required tool broken
+TERMINAL_MEMORY_CONFLICT = "MEMORY_CONFLICT"        # Contradicts known facts
+TERMINAL_OUT_OF_SCOPE = "OUT_OF_SCOPE"              # Can't handle this
+TERMINAL_STALLED = "STALLED"                        # No progress detected
+
+
+class TaskContext:
     """
-    Main agent loop with:
-    0. Autonomy kernel gate (budget, failures, quiet hours)
-    1. Agent proposes tool calls
-    2. Critic validates in parallel
-    3. Safe calls execute
-    4. Failures trigger reflection
-    5. Circuit breaker stops loops
+    Per-task state that flows through the actor state machine.
+    Carries goal, budget, tool discipline, and inter-state data.
+    Everything the dispatcher needs in one object — no globals.
     """
-    # Set query context for smart recall
+    __slots__ = [
+        'task_id', 'goal', 'budget', 'turns_used', 'messages', 'progress',
+        'seen_commands', 'consecutive_errors', 'has_tool_results', 'result',
+        'terminal_state', 'tool_cooldowns',
+        'reflections_used', 'max_reflections', 'tether_injected', 'tool_nudge_used',
+        'pending_calls', 'pending_content', 'approved_calls', 'pending_synthesis',
+    ]
+
+    def __init__(self, user_message: str):
+        self.task_id = f"task_{int(time.time())}"
+        self.goal = user_message
+        self.budget = MAX_TURNS
+        self.turns_used = 0
+        self.messages: list[dict] = []
+        self.progress = ProgressTracker()
+        self.seen_commands: set[str] = set()
+        self.consecutive_errors = 0
+        self.has_tool_results = False
+        self.result = ""
+        self.terminal_state = None
+        # Tool discipline — cooldowns after repeated failure
+        self.tool_cooldowns: dict[str, int] = {}
+        # Reflection leash — cap at 2 reflections per task (item #9)
+        self.reflections_used = 0
+        self.max_reflections = 2
+        # Topic tethering — inject goal reminder when drifting (item #4)
+        self.tether_injected = False
+        # First-turn tool nudge — prevents 3B from answering without using tools
+        self.tool_nudge_used = False
+        # Transient inter-state data
+        self.pending_calls: list[dict] = []
+        self.pending_content = ""
+        self.approved_calls: list[dict] = []
+        self.pending_synthesis = ""
+
+    def available_tools(self) -> list[dict]:
+        """Return TOOLS filtered by cooldowns. Cooled-down tools aren't offered."""
+        return [t for t in TOOLS
+                if self.tool_cooldowns.get(t["function"]["name"], 0) <= 0]
+
+    def tick_cooldowns(self):
+        """Decrease all cooldowns by 1 turn. Expired cooldowns are removed."""
+        expired = [k for k, v in self.tool_cooldowns.items() if v <= 1]
+        for k in expired:
+            del self.tool_cooldowns[k]
+        for k in self.tool_cooldowns:
+            self.tool_cooldowns[k] -= 1
+
+    def apply_cooldown(self, tool_name: str, turns: int = 2):
+        """Put a tool on cooldown after failure. Model won't see it for N turns."""
+        self.tool_cooldowns[tool_name] = turns
+        print(f"  [cooldown] {tool_name} unavailable for {turns} turns")
+
+
+# ── Actor State Machine (v0.9.0) ────────────────────────────────────────────
+#
+# States: INIT → SELECT_TOOL ↔ (CRITIC_CHECK → EXECUTE) → SYNTHESIZE → DONE
+#                    ↑                       ↓
+#                    └────────── (error) ────┘
+#
+# Each state handler takes TaskContext, mutates it, returns next state name.
+# The dispatcher just loops until DONE. No open-ended reasoning, no prose
+# between states — just structured transitions.
+
+def _sm_init(ctx: TaskContext) -> str:
+    """Autonomy gate + message initialization."""
     global _current_user_query
-    _current_user_query = user_message
+    _current_user_query = ctx.goal
 
-    # ── Autonomy Gate ─────────────────────────────────────────
     allowed, reason = autonomy_check()
     if not allowed:
         print(f"  [autonomy] DEFERRED: {reason}")
-        return f"Autonomy kernel deferred this request: {reason}"
+        ctx.result = f"Autonomy kernel deferred this request: {reason}"
+        ctx.terminal_state = TERMINAL_OUT_OF_SCOPE
+        return "DONE"
     if reason != "ok":
         print(f"  [autonomy] {reason}")
 
-    messages = [
+    ctx.messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
+        {"role": "user", "content": ctx.goal},
     ]
+    return "SELECT_TOOL"
 
-    consecutive_errors = 0
-    seen_commands = set()  # detect repeated commands
 
-    has_tool_results = False  # track if we've executed tools — next turn is likely synthesis
+def _sm_select_tool(ctx: TaskContext) -> str:
+    """Ask LLM to pick a tool or produce final answer."""
+    if ctx.turns_used >= ctx.budget:
+        ctx.terminal_state = TERMINAL_STALLED
+        ctx.result = "(max turns reached — stopping)"
+        return "DONE"
 
-    for turn in range(MAX_TURNS):
-        print(f"  [turn {turn + 1}] thinking...", end="", flush=True)
-        t0 = time.time()
+    ctx.turns_used += 1
+    ctx.tick_cooldowns()
 
-        # Use bigger budget if we have tool results (likely synthesis turn)
-        # Skip tool definitions on synthesis turn — saves ~490 prompt tokens
-        budget = MAX_TOKENS_SYNTHESIS if has_tool_results else MAX_TOKENS_TOOL_CALL
-        response = call_llm(messages, max_tokens=budget, include_tools=not has_tool_results)
+    # ── Topic tethering — inject goal reminder when drifting ──
+    # After 3+ turns without results, or after errors, remind model of the task.
+    # Cheap (no LLM call), prevents scope creep and off-topic drift.
+    should_tether = (
+        ctx.turns_used >= 4 and not ctx.has_tool_results
+    ) or (
+        ctx.consecutive_errors >= 2 and not ctx.tether_injected
+    )
+    if should_tether:
+        ctx.tether_injected = True
+        remaining = ctx.budget - ctx.turns_used
+        tether = (f"[FOCUS — {remaining} turns left] "
+                  f"Task: {ctx.goal[:100]}. "
+                  f"Act now or give final answer.")
+        ctx.messages.append({"role": "user", "content": tether})
+        print(f"  [tether] injected goal reminder ({remaining} turns left)")
 
-        if "error" in response:
-            print(f" error")
-            return f"Error: {response['error']}"
+    print(f"  [turn {ctx.turns_used}/{ctx.budget}] thinking...", end="", flush=True)
+    t0 = time.time()
 
-        choice = response["choices"][0]
-        content = choice["message"].get("content", "")
-        elapsed = time.time() - t0
-        tokens = response.get("usage", {}).get("completion_tokens", "?")
-        total_tokens = response.get("usage", {}).get("total_tokens", 0)
-        autonomy_record_call(tokens_used=total_tokens)
-        print(f" {elapsed:.1f}s ({tokens} tokens)")
+    # On potential synthesis turns, skip tool defs to save ~490 prompt tokens
+    is_synthesis_turn = ctx.has_tool_results
+    budget = MAX_TOKENS_SYNTHESIS if is_synthesis_turn else MAX_TOKENS_TOOL_CALL
+    available = ctx.available_tools()
 
-        # Parse tool calls
-        tool_calls = parse_tool_calls(content)
+    response = call_llm(
+        ctx.messages,
+        max_tokens=budget,
+        include_tools=not is_synthesis_turn,
+        tools=available if not is_synthesis_turn else None,
+    )
 
-        if not tool_calls:
-            # Final answer — strip think blocks
-            clean = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-            if not clean:
-                return "(empty response)"
-            # ── Grounding Phase (NUC2 + Brave Search) ────────────
-            if needs_grounding(clean, has_tool_results):
-                print(f"  [grounding] checking factual claims...")
-                clean = grounding_check(clean, user_message)
-            # ── Contradiction Check (NUC2 — against memory) ──────
-            if has_tool_results and len(clean) > 80:
-                print(f"  [contradiction] checking against memory...")
-                clean = contradiction_check(clean, user_message)
-            return clean
+    if "error" in response:
+        print(f" error")
+        ctx.result = f"Error: {response['error']}"
+        ctx.terminal_state = TERMINAL_TOOL_BLOCKED
+        return "DONE"
 
-        # ── Critic Phase (parallel) ──────────────────────────────
-        print(f"  [critic] checking {len(tool_calls)} call(s)...", end="", flush=True)
-        t_critic = time.time()
-        verdicts = critic_check_parallel(tool_calls, user_message)
-        print(f" {time.time() - t_critic:.1f}s")
+    choice = response["choices"][0]
+    content = choice["message"].get("content", "")
+    elapsed = time.time() - t0
+    tokens = response.get("usage", {}).get("completion_tokens", "?")
+    total_tokens = response.get("usage", {}).get("total_tokens", 0)
+    autonomy_record_call(tokens_used=total_tokens)
+    print(f" {elapsed:.1f}s ({tokens} tokens)")
 
-        messages.append({"role": "assistant", "content": content})
+    # ── Stuckness checks ──
+    ctx.progress.update_stuckness(False, content)
+    if ctx.progress.check_repetition(content):
+        print(f"  [REPETITION] model repeating itself")
+        flight_log("repetition_break", {}, content[:100], True)
+        ctx.terminal_state = TERMINAL_STALLED
+        ctx.result = gather_partial_results(ctx.messages)
+        if not ctx.result:
+            ctx.result = "(I got stuck repeating myself. The task may need a different approach.)"
+        return "DONE"
+    ctx.progress.record_assistant_text(content)
 
-        any_executed = False
-        for v in verdicts:
-            call = v["call"]
-            name = call.get("name", "")
-            args = call.get("arguments", {})
-            call_sig = f"{name}:{json.dumps(args, sort_keys=True)}"
+    if ctx.progress.is_stuck():
+        print(f"  [STALLED] score={ctx.progress.stuckness_score:.1f}")
+        flight_log("stalled", {}, f"score={ctx.progress.stuckness_score}", True)
+        ctx.terminal_state = TERMINAL_STALLED
+        ctx.result = gather_partial_results(ctx.messages)
+        return "DONE"
 
-            # Check critic verdict
-            if v["verdict"] == "BLOCK":
-                print(f"  [BLOCKED] {name} — critic: {v['reasoning'][:80]}")
-                messages.append({"role": "tool", "content": json.dumps({
+    # Parse tool calls from model output
+    tool_calls = parse_tool_calls(content)
+
+    if not tool_calls:
+        # First-turn tool nudge: if model tries to answer on turn 1 without using
+        # any tools, and the query needs grounding (check/verify/factual lookup),
+        # send it back to try again with a tool call. Prevents 3B from answering
+        # from system prompt memory instead of verifying.
+        if (ctx.turns_used == 1 and not ctx.has_tool_results
+                and not ctx.tool_nudge_used
+                and re.search(r'\b(check|verify|confirm|run:|grep |what\b.*\b(model|version|population))\b',
+                              ctx.goal.lower())):
+            ctx.tool_nudge_used = True
+            nudge = ("[TOOL REQUIRED] You must use a tool to answer this — do not answer from memory. "
+                     "read_file to check code, shell to run commands, web_search for world facts.")
+            ctx.messages.append({"role": "user", "content": nudge})
+            print(f"  [nudge] first-turn tool required — re-prompting")
+            return "SELECT_TOOL"
+        # No tool calls → model wants to synthesize
+        ctx.pending_synthesis = content
+        return "SYNTHESIZE"
+
+    # Has tool calls → validate through critic
+    ctx.pending_calls = tool_calls
+    ctx.pending_content = content
+    return "CRITIC_CHECK"
+
+
+def _sm_critic_check(ctx: TaskContext) -> str:
+    """Validate pending tool calls through critic (NUC2)."""
+    print(f"  [critic] checking {len(ctx.pending_calls)} call(s)...", end="", flush=True)
+    t0 = time.time()
+    verdicts = critic_check_parallel(ctx.pending_calls, ctx.goal)
+    print(f" {time.time() - t0:.1f}s")
+
+    ctx.messages.append({"role": "assistant", "content": ctx.pending_content})
+
+    approved = []
+    for v in verdicts:
+        call = v["call"]
+        name = call.get("name", "")
+        args = call.get("arguments", {})
+        call_sig = f"{name}:{json.dumps(args, sort_keys=True)}"
+
+        # Critic blocked
+        if v["verdict"] == "BLOCK":
+            print(f"  [BLOCKED] {name} — {v['reasoning'][:80]}")
+            ctx.messages.append({"role": "tool", "content": json.dumps({
+                "name": name,
+                "result": f"BLOCKED by safety critic: {v['reasoning'][:200]}"
+            })})
+            ctx.consecutive_errors += 1
+            continue
+
+        # Exact repeat detection
+        if call_sig in ctx.seen_commands:
+            print(f"  [LOOP] {name} — exact repeat")
+            ctx.messages.append({"role": "tool", "content": json.dumps({
+                "name": name,
+                "result": "LOOP DETECTED: exact repeat. Use DIFFERENT tool or args."
+            })})
+            ctx.consecutive_errors += 1
+            ctx.progress.update_stuckness(True, "loop_detected")
+            continue
+
+        ctx.seen_commands.add(call_sig)
+        approved.append(call)
+
+    if not approved:
+        # All calls blocked or looped
+        if ctx.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            ctx.terminal_state = TERMINAL_TOOL_BLOCKED
+            ctx.result = gather_partial_results(ctx.messages)
+            return "DONE"
+        return "SELECT_TOOL"
+
+    ctx.approved_calls = approved
+    return "EXECUTE"
+
+
+def _sm_execute(ctx: TaskContext) -> str:
+    """Execute approved tool calls, handle errors with recovery state machine."""
+    for call in ctx.approved_calls:
+        name = call.get("name", "")
+        args = call.get("arguments", {})
+
+        # ── Pre-execution argument validation ──
+        validation_error = validate_tool_args(name, args)
+        if validation_error:
+            print(f"  [validate] {name}: {validation_error}")
+            ctx.messages.append({"role": "tool", "content": json.dumps({
+                "name": name, "result": validation_error
+            })})
+            ctx.consecutive_errors += 1
+            continue
+
+        print(f"  [tool] {name}({json.dumps(args)[:80]})")
+        result, is_error = execute_tool(name, args)
+        print(f"  [{'ERROR' if is_error else 'ok'}] {result[:120]}")
+
+        # Per-tool health check
+        fail_warn = tool_failure_warning(name)
+        if fail_warn:
+            print(f"  [tool-health] {fail_warn}")
+
+        if is_error:
+            record_tool_failure(name)
+            error_class, is_retryable = classify_failure(result)
+            flight_log(name, args, result, True, error_class)
+            autonomy_record_call(is_error=True)
+
+            # Recovery state machine
+            recovery_mode = ctx.progress.record_failure(name, args, result)
+            print(f"  [recovery] mode={recovery_mode}")
+
+            # ABORT — exhausted retries
+            if recovery_mode == "ABORT":
+                print(f"  [ABORT] retries exhausted for {name}")
+                ctx.messages.append({"role": "tool", "content": json.dumps({
                     "name": name,
-                    "result": f"BLOCKED by safety critic: {v['reasoning'][:200]}"
+                    "result": f"FAILED: {result}\nABORT: Too many failures. Report what you know."
                 })})
-                consecutive_errors += 1
+                flight_log("abort_exhausted", {"tool": name}, result[:100], True)
+                ctx.consecutive_errors += 1
                 continue
 
-            # Check for repeated commands (loop detection)
-            if call_sig in seen_commands:
-                print(f"  [LOOP] {name} — same call repeated, skipping")
-                messages.append({"role": "tool", "content": json.dumps({
+            # Non-retryable — fatal error
+            if not is_retryable:
+                print(f"  [FATAL] non-retryable ({error_class})")
+                ctx.messages.append({"role": "tool", "content": json.dumps({
                     "name": name,
-                    "result": "LOOP DETECTED: You already tried this exact call. Try a different approach."
+                    "result": RECOVERY_MODE_MESSAGES["ABORT"].format(error=result[:200])
                 })})
-                consecutive_errors += 1
+                ctx.consecutive_errors += 1
                 continue
 
-            seen_commands.add(call_sig)
+            # FALLBACK tier — shell command fails → try read_file
+            if name == "shell":
+                fallback = try_shell_fallback(args.get("command", ""))
+                if fallback is not None:
+                    fb_result, fb_error = fallback
+                    if not fb_error:
+                        flight_log("read_file", {"path": "fallback"}, fb_result[:200], False)
+                        autonomy_record_call(is_error=False)
+                        ctx.consecutive_errors = 0
+                        ctx.has_tool_results = True
+                        ctx.progress.record_success(name, args, fb_result)
+                        ctx.messages.append({"role": "tool", "content": json.dumps({
+                            "name": name,
+                            "result": f"[fallback: read file]\n{verify_tool_output(fb_result)}"
+                        })})
+                        continue
 
-            # Execute
-            print(f"  [tool] {name}({json.dumps(args)[:80]})")
-            result, is_error = execute_tool(name, args)
-            print(f"  [{'ERROR' if is_error else 'ok'}] {result[:120]}")
+            # Tool cooldown — don't offer this tool for 2 turns
+            ctx.apply_cooldown(name, 2)
+            ctx.consecutive_errors += 1
 
-            # Check per-tool failure warning before executing
-            fail_warn = tool_failure_warning(name)
-            if fail_warn:
-                print(f"  [tool-health] {fail_warn}")
-
-            # Flight recorder — log every tool call
-            error_class = None
-            if is_error:
-                record_tool_failure(name)
-                error_class, is_retryable = classify_failure(result)
-                flight_log(name, args, result, True, error_class)
-                autonomy_record_call(is_error=True)
-
-                # Non-retryable? Skip reflection, abort immediately
-                if not is_retryable:
-                    consecutive_errors += 1
-                    print(f"  [FATAL] non-retryable error ({error_class}) — skipping")
-                    messages.append({"role": "tool", "content": json.dumps({
-                        "name": name,
-                        "result": f"FAILED ({error_class}): {result}\nThis error cannot be retried. Try a completely different approach."
-                    })})
-                    continue
-
-                # ── FALLBACK tier: try programmatic fallback (no LLM call) ──
-                if name == "shell":
-                    fallback = try_shell_fallback(args.get("command", ""))
-                    if fallback is not None:
-                        fb_result, fb_error = fallback
-                        if not fb_error:
-                            # Fallback succeeded — feed result to model, not the error
-                            flight_log("read_file", {"path": "fallback"}, fb_result[:200], False)
-                            autonomy_record_call(is_error=False)
-                            consecutive_errors = 0
-                            any_executed = True
-                            has_tool_results = True
-                            messages.append({"role": "tool", "content": json.dumps({
-                                "name": name,
-                                "result": f"[Command failed, but read the file directly instead]\n{verify_tool_output(fb_result)}"
-                            })})
-                            continue
-
-                consecutive_errors += 1
-
-                # ── RETRY tier: Reflection Phase ─────────────────────
-                print(f"  [reflect] analyzing failure ({error_class})...", end="", flush=True)
-                t_ref = time.time()
-                reflection = reflect_on_failure(name, args, result, user_message)
-                print(f" {time.time() - t_ref:.1f}s")
+            # RETRY tier — leashed reflection on NUC3 (max 2 per task)
+            if ctx.reflections_used < ctx.max_reflections:
+                ctx.reflections_used += 1
+                print(f"  [reflect {ctx.reflections_used}/{ctx.max_reflections}] {recovery_mode} ({error_class})...", end="", flush=True)
+                t0 = time.time()
+                reflection = reflect_on_failure(name, args, result, ctx.goal, recovery_mode)
+                print(f" {time.time() - t0:.1f}s")
                 print(f"  [reflect] {reflection[:120]}")
 
-                # Check if reflector says abort — require "ABORT:" or "ABORT." to avoid false positives
+                # Reflector says abort → clean exit
                 first_word = reflection.strip().split()[0].upper() if reflection.strip() else ""
-                if first_word == "ABORT:" or first_word == "ABORT.":
-                    messages.append({"role": "tool", "content": json.dumps({
-                        "name": name,
-                        "result": f"FAILED: {result}\nREFLECTION: {reflection}"
+                if first_word in ("ABORT:", "ABORT."):
+                    ctx.messages.append({"role": "tool", "content": json.dumps({
+                        "name": name, "result": f"FAILED: {result}\n{reflection}"
                     })})
-                    return f"Task aborted: {reflection}"
+                    ctx.terminal_state = TERMINAL_TOOL_BLOCKED
+                    ctx.result = f"Task aborted: {reflection}"
+                    return "DONE"
 
-                fail_msg = f"FAILED: {result}\nREFLECTION: {reflection}\nTry a different approach."
-                fw = tool_failure_warning(name)
-                if fw:
-                    fail_msg += f"\n{fw}"
-                messages.append({"role": "tool", "content": json.dumps({
-                    "name": name, "result": fail_msg
-                })})
+                # Recovery-mode message + reflection
+                fail_msg = RECOVERY_MODE_MESSAGES.get(recovery_mode, "FAILED: {error}").format(error=result[:200])
+                fail_msg += f"\nREFLECTION: {reflection}"
             else:
-                record_tool_success(name)
-                flight_log(name, args, result, False)
-                autonomy_record_call(is_error=False)
-                consecutive_errors = 0  # reset on success
-                any_executed = True
-                has_tool_results = True
-                messages.append({"role": "tool", "content": json.dumps({
-                    "name": name, "result": verify_tool_output(result)
-                })})
+                # Reflection budget exhausted — no more LLM calls for recovery
+                print(f"  [reflect] budget exhausted ({ctx.max_reflections} used) — raw error only")
+                fail_msg = RECOVERY_MODE_MESSAGES.get(recovery_mode, "FAILED: {error}").format(error=result[:200])
 
-        # ── Circuit Breaker (DEGRADE tier) ─────────────────────────
-        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-            print(f"  [CIRCUIT BREAKER] {consecutive_errors} consecutive errors — degrading")
-            return gather_partial_results(messages)
+            if fail_warn:
+                fail_msg += f"\n{fail_warn}"
+            ctx.messages.append({"role": "tool", "content": json.dumps({
+                "name": name, "result": fail_msg
+            })})
+        else:
+            # Success
+            record_tool_success(name)
+            flight_log(name, args, result, False)
+            autonomy_record_call(is_error=False)
+            ctx.consecutive_errors = 0
+            ctx.has_tool_results = True
+            ctx.progress.record_success(name, args, result)
+            # Auto-record significant results as episodic observations
+            if len(result) > 30 and name not in ("scratchpad", "recall"):
+                episodic_write(f"{name}: {result[:200]}", source=name)
+            ctx.messages.append({"role": "tool", "content": json.dumps({
+                "name": name, "result": verify_tool_output(result)
+            })})
 
-    return "(max turns reached — stopping)"
+    # Circuit breaker
+    if ctx.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+        print(f"  [CIRCUIT BREAKER] {ctx.consecutive_errors} consecutive errors")
+        ctx.terminal_state = TERMINAL_TOOL_BLOCKED
+        ctx.result = gather_partial_results(ctx.messages)
+        return "DONE"
+
+    # Stuckness check
+    if ctx.progress.is_stuck():
+        print(f"  [STALLED] score={ctx.progress.stuckness_score:.1f}")
+        flight_log("stalled", {}, f"score={ctx.progress.stuckness_score}", True)
+        ctx.terminal_state = TERMINAL_STALLED
+        ctx.result = gather_partial_results(ctx.messages)
+        return "DONE"
+
+    return "SELECT_TOOL"
+
+
+def _sm_synthesize(ctx: TaskContext) -> str:
+    """
+    Generate final answer with claim-level verification (v0.9.0).
+    Decomposes synthesis into atomic claims, verifies each against
+    web + memory evidence. 2 LLM calls (extract + verify), not 3.
+    Falls back to legacy grounding if claim extraction fails.
+    Terminal state set based on verification results.
+    """
+    clean = re.sub(r'<think>.*?</think>', '', ctx.pending_synthesis, flags=re.DOTALL).strip()
+    if not clean:
+        ctx.result = "(empty response)"
+        ctx.terminal_state = TERMINAL_ANSWER
+        return "DONE"
+
+    # ── Claim Decomposition (replaces grounding + contradiction) ──
+    verdict_info = None
+    if needs_grounding(clean, ctx.has_tool_results):
+        print(f"  [verify] extracting claims...")
+        claims = extract_claims(clean)
+        if claims:
+            print(f"  [verify] {len(claims)} claims: {[c[:40] for c in claims]}")
+            clean, verdict_info = verify_claims(claims, clean, ctx.goal, ctx.has_tool_results)
+        else:
+            # No claims extracted — fall back to legacy grounding
+            print(f"  [verify] no claims found — legacy grounding")
+            clean = grounding_check(clean, ctx.goal)
+
+    ctx.result = clean
+
+    # ── Terminal state selection based on verification ──
+    if verdict_info and verdict_info["contradicted"] > 0:
+        ctx.terminal_state = TERMINAL_MEMORY_CONFLICT
+    elif verdict_info and verdict_info["unsupported"] > verdict_info["total"] // 2:
+        ctx.terminal_state = TERMINAL_INSUFFICIENT
+    else:
+        ctx.terminal_state = TERMINAL_ANSWER
+    return "DONE"
+
+
+# State dispatch table — deterministic, no open-ended loops
+_STATE_HANDLERS = {
+    "INIT":         _sm_init,
+    "SELECT_TOOL":  _sm_select_tool,
+    "CRITIC_CHECK": _sm_critic_check,
+    "EXECUTE":      _sm_execute,
+    "SYNTHESIZE":   _sm_synthesize,
+}
+
+
+def run_agent(user_message: str) -> str:
+    """
+    State machine agent loop (v0.9.0).
+
+    States: INIT → SELECT_TOOL ↔ (CRITIC_CHECK → EXECUTE) → SYNTHESIZE → DONE
+
+    Each state is a function that takes TaskContext, mutates it, returns next state.
+    The dispatcher just loops. No open-ended reasoning between states.
+    Tool discipline: cooldowns after failure, filtered tool lists.
+    Terminal states: ANSWER, INSUFFICIENT_EVIDENCE, TOOL_FAILURE_BLOCKING, STALLED.
+    """
+    ctx = TaskContext(user_message)
+    state = "INIT"
+
+    while state != "DONE":
+        handler = _STATE_HANDLERS.get(state)
+        if handler is None:
+            ctx.result = f"Internal error: unknown state '{state}'"
+            break
+        state = handler(ctx)
+
+    # Log terminal state to flight recorder
+    if ctx.terminal_state:
+        flight_log("terminal_state", {"state": ctx.terminal_state, "task_id": ctx.task_id},
+                   ctx.result[:200], ctx.terminal_state != TERMINAL_ANSWER)
+        if ctx.terminal_state != TERMINAL_ANSWER:
+            print(f"  [terminal] {ctx.terminal_state}")
+
+    return ctx.result
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -1455,8 +2330,8 @@ def log_interaction(user_msg: str, response: str):
 def main():
     print("""
     ╔═══════════════════════════════════════════╗
-    ║  🦀 SmolClaw v0.8.0                      ║
-    ║  SmolLM3-3B · 3-NUC Cognitive Cluster   ║
+    ║  🦀 SmolClaw v0.9.0                      ║
+    ║  SmolLM3-3B · State Machine Cluster     ║
     ║  $75 yard sale hardware · AI for all    ║
     ╚═══════════════════════════════════════════╝
     """)

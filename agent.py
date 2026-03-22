@@ -1789,15 +1789,16 @@ def needs_decomposition(text: str) -> bool:
     return True  # Default: try AoT for longer/complex queries
 
 
-def run_agent_aot(user_message: str) -> str:
+def run_agent_aot(user_message: str, history: list = None) -> str:
     """
     Atom of Thoughts wrapper: decompose complex tasks, solve atoms independently,
     synthesize results. Falls back to standard agent for simple tasks.
+    history: optional list of {"role": "user"|"assistant", "content": "..."} from prior turns.
     """
     # Heuristic bypass — skip decomposition for obviously simple queries
     if not needs_decomposition(user_message):
         print(f"  [aot] simple query — skipping decomposition")
-        return run_agent(user_message)
+        return run_agent(user_message, history=history)
 
     print(f"  [aot] decomposing...", end="", flush=True)
     t0 = time.time()
@@ -1806,7 +1807,7 @@ def run_agent_aot(user_message: str) -> str:
 
     # Simple task — run directly
     if len(atoms) <= 1 or "SIMPLE" in atoms:
-        return run_agent(user_message)
+        return run_agent(user_message, history=history)
 
     print(f"  [aot] atoms: {atoms}")
 
@@ -1853,16 +1854,17 @@ class TaskContext:
     Everything the dispatcher needs in one object — no globals.
     """
     __slots__ = [
-        'task_id', 'goal', 'budget', 'turns_used', 'messages', 'progress',
+        'task_id', 'goal', 'history', 'budget', 'turns_used', 'messages', 'progress',
         'seen_commands', 'consecutive_errors', 'has_tool_results', 'result',
         'terminal_state', 'tool_cooldowns',
         'reflections_used', 'max_reflections', 'tether_injected', 'tool_nudge_used',
         'pending_calls', 'pending_content', 'approved_calls', 'pending_synthesis',
     ]
 
-    def __init__(self, user_message: str):
+    def __init__(self, user_message: str, history: list = None):
         self.task_id = f"task_{int(time.time())}"
         self.goal = user_message
+        self.history = history or []
         self.budget = MAX_TURNS
         self.turns_used = 0
         self.messages: list[dict] = []
@@ -1932,8 +1934,13 @@ def _sm_init(ctx: TaskContext) -> str:
 
     ctx.messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": ctx.goal},
     ]
+    # Inject conversation history for context continuity
+    if ctx.history:
+        for turn in ctx.history:
+            ctx.messages.append({"role": turn["role"], "content": turn["content"]})
+        print(f"  [context] {len(ctx.history)} prior turn(s) injected")
+    ctx.messages.append({"role": "user", "content": ctx.goal})
     return "SELECT_TOOL"
 
 
@@ -2283,7 +2290,7 @@ _STATE_HANDLERS = {
 }
 
 
-def run_agent(user_message: str) -> str:
+def run_agent(user_message: str, history: list = None) -> str:
     """
     State machine agent loop (v0.9.0).
 
@@ -2294,7 +2301,7 @@ def run_agent(user_message: str) -> str:
     Tool discipline: cooldowns after failure, filtered tool lists.
     Terminal states: ANSWER, INSUFFICIENT_EVIDENCE, TOOL_FAILURE_BLOCKING, STALLED.
     """
-    ctx = TaskContext(user_message)
+    ctx = TaskContext(user_message, history=history)
     state = "INIT"
 
     while state != "DONE":

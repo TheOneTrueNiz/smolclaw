@@ -212,12 +212,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not msg:
                 self._json({"error": "empty"}, 400)
                 return
+            # Build conversation history for context continuity
+            # Cap at last 3 exchanges (~6 messages) to stay within 8K context
+            history = []
+            if cid:
+                convo = get_conversation(cid)
+                if convo and convo.get("messages"):
+                    recent = convo["messages"][-6:]  # last 3 exchanges
+                    for m in recent:
+                        # Truncate long messages to save context budget
+                        content = m["content"][:500]
+                        history.append({"role": m["role"], "content": content})
+
             with _agent_lock:
                 _agent_status["running"] = True
                 _agent_status["query"] = msg[:80]
                 try:
-                    print(f"[web] query: {msg[:80]}")
-                    response = run_agent_aot(msg)
+                    print(f"[web] query: {msg[:80]} (history: {len(history)} turns)")
+                    response = run_agent_aot(msg, history=history)
                     print(f"[web] response: {response[:80]}")
                 finally:
                     _agent_status["running"] = False

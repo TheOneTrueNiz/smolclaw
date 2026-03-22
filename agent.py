@@ -2398,6 +2398,26 @@ def _sm_execute(ctx: TaskContext) -> str:
     return "SELECT_TOOL"
 
 
+def _trim_to_last_sentence(text: str) -> str:
+    """Trim text to the last complete sentence. If no sentence boundary found,
+    trim to last word boundary and add ellipsis."""
+    # Already ends cleanly
+    if re.search(r'[.!?)\]"\']\s*$', text):
+        return text
+
+    # Find last real sentence boundary: period/!/?  followed by space,
+    # but NOT a bare number+dot (like "3.") which is a list marker.
+    last = -1
+    for m in re.finditer(r'(?<!\d)[.!?]\s', text):
+        last = m.start() + 1  # include the punctuation
+    if last > len(text) * 0.5:  # only trim if we keep at least half
+        return text[:last].rstrip()
+
+    # No good sentence boundary — trim to last word boundary + ellipsis
+    trimmed = text.rsplit(None, 1)[0] if ' ' in text else text
+    return trimmed.rstrip('.,;:-') + "..."
+
+
 def _sm_synthesize(ctx: TaskContext) -> str:
     """
     Generate final answer with claim-level verification (v0.9.0).
@@ -2411,6 +2431,14 @@ def _sm_synthesize(ctx: TaskContext) -> str:
         ctx.result = "(empty response)"
         ctx.terminal_state = TERMINAL_ANSWER
         return "DONE"
+
+    # ── Graceful truncation handling ──
+    # If we already continued once and it's still ragged, trim cleanly
+    if ctx._continued:
+        trimmed = _trim_to_last_sentence(clean)
+        if trimmed != clean:
+            print(f"  [trim] cleaned truncated response ({len(clean)} → {len(trimmed)} chars)")
+            clean = trimmed
 
     # ── Claim Decomposition (replaces grounding + contradiction) ──
     verdict_info = None

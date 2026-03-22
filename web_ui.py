@@ -32,16 +32,19 @@ sys.path.insert(0, str(BASE_DIR))
 _host = os.uname().nodename
 if _host == "nizbot1":
     from agent import (run_agent_aot, LLAMA_URL, CRITIC_URL, MEMORY_URL,
-                        DAILY_CALL_BUDGET, DAILY_TOKEN_BUDGET)
+                        DAILY_CALL_BUDGET, DAILY_TOKEN_BUDGET,
+                        assemble_context, summarize_conversation)
     _agent_label = "agent.py (local)"
 else:
     try:
         from agent_hackbook import (run_agent_aot, LLAMA_URL, CRITIC_URL, MEMORY_URL,
-                                     DAILY_CALL_BUDGET, DAILY_TOKEN_BUDGET)
+                                     DAILY_CALL_BUDGET, DAILY_TOKEN_BUDGET,
+                                     assemble_context, summarize_conversation)
         _agent_label = "agent_hackbook.py (tailscale)"
     except ImportError:
         from agent import (run_agent_aot, LLAMA_URL, CRITIC_URL, MEMORY_URL,
-                            DAILY_CALL_BUDGET, DAILY_TOKEN_BUDGET)
+                            DAILY_CALL_BUDGET, DAILY_TOKEN_BUDGET,
+                            assemble_context, summarize_conversation)
         _agent_label = "agent.py (fallback)"
 
 
@@ -82,7 +85,8 @@ def list_conversations():
 def create_conversation():
     cid = uuid.uuid4().hex[:8]
     now = datetime.now().isoformat()
-    data = {"id": cid, "title": "New chat", "created": now, "updated": now, "messages": []}
+    data = {"id": cid, "title": "New chat", "created": now, "updated": now,
+            "summary": "", "summary_through": 0, "messages": []}
     (CONVERSATIONS_DIR / f"{cid}.json").write_text(json.dumps(data))
     return data
 
@@ -103,6 +107,21 @@ def delete_conversation(cid):
         p.unlink()
         return True
     return False
+
+
+def _generate_title(user_msg: str) -> str:
+    """Generate a conversation title from the first message. No LLM call."""
+    clean = user_msg.strip()
+    for prefix in ("hey ", "hi ", "hello ", "can you ", "please ", "could you ",
+                    "what is ", "what's ", "tell me "):
+        if clean.lower().startswith(prefix):
+            clean = clean[len(prefix):]
+            break
+    if clean:
+        clean = clean[0].upper() + clean[1:]
+    if len(clean) > 50:
+        clean = clean[:47].rsplit(" ", 1)[0] + "..."
+    return clean or "Chat"
 
 
 # ── Cluster health ─────────────────────────────────────────────────────────
@@ -163,6 +182,50 @@ def read_memory():
         return "(error)"
 
 
+# ── Background Summarization ──────────────────────────────────────────────
+
+
+def _trigger_background_summary(cid: str):
+    """Trigger background conversation summarization on NUC3.
+    Non-blocking: runs in a daemon thread after response is sent."""
+    def _do_summary():
+        try:
+            convo = get_conversation(cid)
+            if not convo:
+                return
+            messages = convo.get("messages", [])
+            summary_through = convo.get("summary_through", 0)
+
+            # Only summarize if 4+ unsummarized messages (2 exchanges)
+            unsummarized = len(messages) - summary_through
+            if unsummarized < 4:
+                return
+
+            # Summarize all but the last 2 messages (keep 1 exchange raw)
+            to_summarize = messages[summary_through:-2] if len(messages) > summary_through + 2 else []
+            if not to_summarize:
+                return
+
+            prev_summary = convo.get("summary", "")
+
+            print(f"[summary] generating for {cid} ({len(to_summarize)} msgs)...", flush=True)
+            new_summary = summarize_conversation(prev_summary, to_summarize)
+
+            if new_summary:
+                # Re-read to handle concurrent writes
+                convo = get_conversation(cid)
+                if convo:
+                    convo["summary"] = new_summary
+                    convo["summary_through"] = len(convo["messages"]) - 2
+                    save_conversation(convo)
+                    print(f"[summary] saved for {cid}: {new_summary[:80]}...")
+        except Exception as e:
+            print(f"[summary] error for {cid}: {e}")
+
+    thread = threading.Thread(target=_do_summary, daemon=True)
+    thread.start()
+
+
 # ── HTTP Handler ───────────────────────────────────────────────────────────
 
 
@@ -212,17 +275,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not msg:
                 self._json({"error": "empty"}, 400)
                 return
-            # Build conversation history for context continuity
-            # Cap at last 3 exchanges (~6 messages) to stay within 8K context
+            # Smart context assembly: summary + recent raw messages
             history = []
+            convo = None
             if cid:
                 convo = get_conversation(cid)
                 if convo and convo.get("messages"):
-                    recent = convo["messages"][-6:]  # last 3 exchanges
-                    for m in recent:
-                        # Truncate long messages to save context budget
-                        content = m["content"][:500]
-                        history.append({"role": m["role"], "content": content})
+                    try:
+                        summary = convo.get("summary", "")
+                        summary_through = convo.get("summary_through", 0)
+                        history = assemble_context(
+                            msg, summary, convo["messages"], summary_through
+                        )
+                    except Exception:
+                        # Graceful degradation: naive truncation
+                        recent = convo["messages"][-6:]
+                        for m in recent:
+                            history.append({"role": m["role"], "content": m["content"][:500]})
 
             with _agent_lock:
                 _agent_status["running"] = True
@@ -242,8 +311,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     convo["messages"].append({"role": "user", "content": msg, "timestamp": ts})
                     convo["messages"].append({"role": "assistant", "content": response, "timestamp": ts})
                     if convo["title"] == "New chat":
-                        convo["title"] = msg[:50] + ("..." if len(msg) > 50 else "")
+                        convo["title"] = _generate_title(msg)
                     save_conversation(convo)
+                    # Trigger background summarization (non-blocking)
+                    _trigger_background_summary(cid)
             self._json({"response": response})
 
         elif self.path == '/api/conversations':

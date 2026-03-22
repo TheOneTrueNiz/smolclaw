@@ -59,6 +59,25 @@ MAX_TOKENS_CRITIC = 32       # just "SAFE" or "BLOCK"
 MAX_TOKENS_REFLECT = 64      # one sentence suggestion
 MAX_TOKENS_RECALL = 256      # room for relevant memories
 MAX_TOKENS_CONTRADICTION = 64  # CONSISTENT or CONTRADICTION: ...
+MAX_TOKENS_SUMMARIZE = 200     # conversation summary (NUC3, background)
+
+# ── Context budget constants (8192 total) ────────────────────────────────────
+SUMMARY_BUDGET = 600           # max tokens for compressed old-history summary
+RECENT_RAW_BUDGET = 1500       # max tokens for recent raw messages
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate BPE token count without a tokenizer.
+    Calibrated for SmolLM3-3B: ~1.3 tokens/word for prose,
+    ~2.0 tokens/word for JSON/code."""
+    if not text:
+        return 0
+    words = len(text.split())
+    json_chars = text.count('{') + text.count('"') + text.count(':')
+    if json_chars > words * 0.3:
+        return int(words * 2.0)
+    return int(words * 1.3)
+
 
 # ── Tools ───────────────────────────────────────────────────────────────────
 
@@ -1393,6 +1412,64 @@ def episodic_read(max_entries: int = 10) -> list[dict]:
     return fresh[-max_entries:]
 
 
+# ── Conversation Summarization (COMPASS-style rolling notes) ─────────────────
+
+SUMMARIZE_PROMPT = """/no_think
+Rewrite conversation notes incorporating new exchanges.
+
+Previous notes:
+{prev_summary}
+
+New exchanges:
+{new_exchanges}
+
+Format (max 150 words):
+TOPIC: [main subject in 5 words]
+FACTS: [bullet list of established facts, decisions, numbers]
+ENTITIES: [people, files, tools, URLs mentioned]
+OPEN: [what the user still needs or asked last]
+TONE: [user mood/intent in 3 words]
+
+Updated notes:"""
+
+
+def summarize_conversation(prev_summary: str, new_exchanges: list) -> str:
+    """Generate structured conversation summary on NUC3.
+    Returns structured notes or previous summary on failure."""
+    if not new_exchanges:
+        return prev_summary or ""
+
+    # Format new exchanges compactly
+    exchange_text = ""
+    for msg in new_exchanges:
+        role = "User" if msg.get("role") == "user" else "SmolClaw"
+        content = msg.get("content", "")[:300]
+        exchange_text += f"{role}: {content}\n"
+
+    prompt = SUMMARIZE_PROMPT.format(
+        prev_summary=prev_summary or "(first exchange — no prior notes)",
+        new_exchanges=exchange_text,
+    )
+
+    try:
+        result = call_llm_simple(
+            [{"role": "user", "content": prompt}],
+            max_tokens=MAX_TOKENS_SUMMARIZE,
+            url=MEMORY_URL,
+            stop=["\n\n\n"],
+        )
+        cleaned = result.strip()
+        # Validate: must contain at least TOPIC: or FACTS:
+        if any(k in cleaned for k in ("TOPIC:", "FACTS:", "ENTITIES:", "OPEN:")):
+            return cleaned
+        # Garbage output — keep previous summary
+        print(f"  [summary] invalid output, keeping previous")
+        return prev_summary or ""
+    except Exception as e:
+        print(f"  [summary] NUC3 error: {e}")
+        return prev_summary or ""
+
+
 MEMORY_VERIFY_PROMPT = """/no_think
 Proposed memory: {note}
 Context: {context}
@@ -1859,6 +1936,7 @@ class TaskContext:
         'terminal_state', 'tool_cooldowns',
         'reflections_used', 'max_reflections', 'tether_injected', 'tool_nudge_used',
         'pending_calls', 'pending_content', 'approved_calls', 'pending_synthesis',
+        '_continued',
     ]
 
     def __init__(self, user_message: str, history: list = None):
@@ -1888,6 +1966,7 @@ class TaskContext:
         self.pending_content = ""
         self.approved_calls: list[dict] = []
         self.pending_synthesis = ""
+        self._continued = False
 
     def available_tools(self) -> list[dict]:
         """Return TOOLS filtered by cooldowns. Cooled-down tools aren't offered."""
@@ -1906,6 +1985,66 @@ class TaskContext:
         """Put a tool on cooldown after failure. Model won't see it for N turns."""
         self.tool_cooldowns[tool_name] = turns
         print(f"  [cooldown] {tool_name} unavailable for {turns} turns")
+
+
+# ── Smart Context Assembly ────────────────────────────────────────────────────
+
+
+def assemble_context(user_message: str, summary: str, messages: list,
+                     summary_through: int) -> list:
+    """Assemble conversation history within token budget.
+
+    Three tiers:
+      1. Compressed summary of old history (Tier 1, ~200-600 tokens)
+      2. Recent raw messages after summary pointer (Tier 2, ~800-1500 tokens)
+      3. Current user message — handled by _sm_init, not here
+
+    Returns list of {"role": ..., "content": ...} dicts.
+    """
+    history = []
+
+    # Tier 1: Compressed summary of old history
+    if summary and summary.strip():
+        summary_text = summary.strip()
+        summary_tokens = estimate_tokens(summary_text)
+        if summary_tokens > SUMMARY_BUDGET:
+            # Truncate by words to fit budget
+            words = summary_text.split()
+            target_words = int(SUMMARY_BUDGET / 1.3)
+            summary_text = " ".join(words[:target_words])
+        history.append({
+            "role": "user",
+            "content": f"[Previous conversation summary]\n{summary_text}"
+        })
+
+    # Tier 2: Recent raw messages (after summary pointer)
+    if messages:
+        recent_msgs = messages[summary_through:] if summary_through < len(messages) else messages[-4:]
+
+        # Fit within RECENT_RAW_BUDGET — take most recent first
+        budget_remaining = RECENT_RAW_BUDGET
+        selected = []
+        for msg in reversed(recent_msgs):
+            content = msg.get("content", "")
+            msg_tokens = estimate_tokens(content)
+            if msg_tokens > budget_remaining:
+                # Truncate this message to fit remaining budget
+                if budget_remaining > 50:
+                    words = content.split()
+                    target_words = int(budget_remaining / 1.3)
+                    truncated = " ".join(words[:target_words]) + "..."
+                    selected.append({"role": msg["role"], "content": truncated})
+                break
+            budget_remaining -= msg_tokens
+            selected.append({"role": msg["role"], "content": content})
+            if budget_remaining <= 0:
+                break
+
+        # Reverse back to chronological order
+        selected.reverse()
+        history.extend(selected)
+
+    return history
 
 
 # ── Actor State Machine (v0.9.0) ────────────────────────────────────────────
@@ -1935,11 +2074,12 @@ def _sm_init(ctx: TaskContext) -> str:
     ctx.messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
-    # Inject conversation history for context continuity
+    # Inject conversation history (assembled by web_ui: summary + recent raw)
     if ctx.history:
         for turn in ctx.history:
             ctx.messages.append({"role": turn["role"], "content": turn["content"]})
-        print(f"  [context] {len(ctx.history)} prior turn(s) injected")
+        total_tokens = sum(estimate_tokens(t["content"]) for t in ctx.history)
+        print(f"  [context] {len(ctx.history)} turn(s), ~{total_tokens} tokens")
     ctx.messages.append({"role": "user", "content": ctx.goal})
     return "SELECT_TOOL"
 
@@ -2037,7 +2177,24 @@ def _sm_select_tool(ctx: TaskContext) -> str:
             ctx.messages.append({"role": "user", "content": nudge})
             print(f"  [nudge] first-turn tool required — re-prompting")
             return "SELECT_TOOL"
+
+        # ── Truncation recovery ──
+        # If the response hit max_tokens, it was cut off mid-thought.
+        # Continue once: inject partial as assistant msg, prompt "Continue:",
+        # concatenate. Cap at 1 continuation to avoid spirals.
+        finish_reason = choice.get("finish_reason", "stop")
+        if finish_reason == "length" and not ctx._continued:
+            ctx._continued = True
+            ctx.pending_synthesis = content  # stash partial for concatenation
+            print(f"  [truncated] response hit max_tokens — requesting continuation")
+            ctx.messages.append({"role": "assistant", "content": content})
+            ctx.messages.append({"role": "user", "content": "Continue from where you left off. Finish your response concisely."})
+            return "SELECT_TOOL"
+
         # No tool calls → model wants to synthesize
+        # If this is a continuation, concatenate with prior partial
+        if ctx._continued and ctx.pending_synthesis:
+            content = ctx.pending_synthesis + " " + content
         ctx.pending_synthesis = content
         return "SYNTHESIZE"
 

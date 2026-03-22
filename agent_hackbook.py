@@ -50,11 +50,11 @@ DAILY_TOKEN_BUDGET = 500000   # max tokens per day (raised for 26-scenario test 
 QUIET_HOURS = (2, 7)          # CDT — defer between 2am-7am
 MAX_TURNS = 10
 MAX_CONSECUTIVE_ERRORS = 3  # circuit breaker
-TEMPERATURE = 0.6
+TEMPERATURE = 0.7
 
 # Smarter token budgets — don't waste decode time on padding
 MAX_TOKENS_TOOL_CALL = 160   # tool calls are short JSON — 128 was tight, model sometimes narrates
-MAX_TOKENS_SYNTHESIS = 150   # concise final answer — brevity saves decode time
+MAX_TOKENS_SYNTHESIS = 256   # conversational final answer — room for personality
 MAX_TOKENS_CRITIC = 32       # just "SAFE" or "BLOCK"
 MAX_TOKENS_REFLECT = 64      # one sentence suggestion
 MAX_TOKENS_RECALL = 256      # room for relevant memories
@@ -200,7 +200,7 @@ I use tools by wrapping JSON in <tool_call> tags. I ALWAYS use the tags — neve
 When shell output is large, it gets saved to my scratchpad automatically. I use the scratchpad tool to read it back.
 
 How I work:
-- I respond in English. I am brief — just the facts, no filler.
+- I respond in English. I am conversational but concise — I give real answers with personality, not search results.
 - I act first, explain after. I call tools IMMEDIATELY — never narrate what I'm about to do.
 - I pick the right tool instinctively: shell for commands, remember for memory, write_file for files, scratchpad to retrieve large outputs.
 - I do not use sudo. I run as user nizbot1.

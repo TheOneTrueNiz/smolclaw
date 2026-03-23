@@ -267,6 +267,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _sse_event(self, event_type, data):
+        """Send a single SSE event."""
+        payload = json.dumps({"type": event_type, **data})
+        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
     def do_POST(self):
         if self.path == '/chat':
             body = self._body()
@@ -293,16 +299,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         for m in recent:
                             history.append({"role": m["role"], "content": m["content"][:500]})
 
+            # Set up SSE streaming response
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            self._sse_event("status", {"text": "thinking..."})
+
+            def on_token(token):
+                """Called per-token during streaming synthesis."""
+                try:
+                    self._sse_event("token", {"text": token})
+                except Exception:
+                    pass  # client disconnected
+
             with _agent_lock:
                 _agent_status["running"] = True
                 _agent_status["query"] = msg[:80]
                 try:
                     print(f"[web] query: {msg[:80]} (history: {len(history)} turns)")
-                    response = run_agent_aot(msg, history=history)
+                    response = run_agent_aot(msg, history=history, on_token=on_token)
                     print(f"[web] response: {response[:80]}")
                 finally:
                     _agent_status["running"] = False
                     _agent_status["query"] = ""
+
+            # Send final response (includes any critic corrections)
+            self._sse_event("done", {"response": response})
+
             # Save to conversation
             if cid:
                 convo = get_conversation(cid)
@@ -315,7 +342,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     save_conversation(convo)
                     # Trigger background summarization (non-blocking)
                     _trigger_background_summary(cid)
-            self._json({"response": response})
 
         elif self.path == '/api/conversations':
             self._json(create_conversation())
@@ -348,7 +374,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 # ── HTML ───────────────────────────────────────────────────────────────────
 
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -775,15 +801,61 @@ async function sendMsg() {
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:text, conversation_id:currentConvoId})
     });
-    const data = await res.json();
-    clearInterval(ti);
-    thinkDiv.className = 'msg assistant';
-    thinkDiv.innerHTML = linkify(data.response);
-    thinkDiv.style.fontStyle = 'normal';
-    statusEl.textContent = '';
-    loadConversations();
-    refreshState();
-    refreshFlightLog();
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let streamedText = '';
+    let streaming = false;
+    let sseBuffer = '';
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      sseBuffer += decoder.decode(value, {stream: true});
+
+      let boundary;
+      while ((boundary = sseBuffer.indexOf('\n\n')) !== -1) {
+        const raw = sseBuffer.slice(0, boundary).trim();
+        sseBuffer = sseBuffer.slice(boundary + 2);
+        if (!raw.startsWith('data: ')) continue;
+        let evt;
+        try { evt = JSON.parse(raw.slice(6)); } catch(e) { continue; }
+
+        if (evt.type === 'status') {
+          if (!streaming) {
+            thinkDiv.textContent = evt.text;
+            statusEl.textContent = evt.text;
+          }
+        } else if (evt.type === 'token') {
+          if (!streaming) {
+            streaming = true;
+            clearInterval(ti);
+            thinkDiv.className = 'msg assistant';
+            thinkDiv.style.fontStyle = 'normal';
+            thinkDiv.innerHTML = '';
+            statusEl.textContent = 'streaming...';
+          }
+          streamedText += evt.text;
+          thinkDiv.innerHTML = linkify(streamedText);
+          msgs.scrollTop = msgs.scrollHeight;
+        } else if (evt.type === 'done') {
+          clearInterval(ti);
+          thinkDiv.className = 'msg assistant';
+          thinkDiv.style.fontStyle = 'normal';
+          thinkDiv.innerHTML = linkify(evt.response);
+          statusEl.textContent = '';
+          loadConversations();
+          refreshState();
+          refreshFlightLog();
+        }
+      }
+    }
+    // If no 'done' event was received (fallback), finalize
+    if (statusEl.textContent === 'streaming...') {
+      statusEl.textContent = '';
+      loadConversations();
+      refreshState();
+      refreshFlightLog();
+    }
   } catch(err) {
     clearInterval(ti);
     thinkDiv.className = 'msg assistant';

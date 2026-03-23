@@ -1638,6 +1638,56 @@ def call_llm(messages: list, max_tokens: int = None, temperature: float = None,
         return {"error": str(e)}
 
 
+def call_llm_stream(messages: list, max_tokens: int = None, temperature: float = None,
+                    on_token=None) -> tuple:
+    """Streaming LLM call for synthesis — yields tokens via callback.
+    Returns (full_content, finish_reason). No tools — synthesis only."""
+    body = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": temperature or TEMPERATURE,
+        "max_tokens": max_tokens or MAX_TOKENS_SYNTHESIS,
+        "stream": True,
+    }
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(
+        LLAMA_URL, data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    full_content = ""
+    finish_reason = "stop"
+    try:
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            while True:
+                line = resp.readline()
+                if not line:
+                    break
+                line = line.decode("utf-8").strip()
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    choice = chunk.get("choices", [{}])[0]
+                    delta = choice.get("delta", {})
+                    content = delta.get("content", "")
+                    fr = choice.get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+                    if content:
+                        full_content += content
+                        if on_token:
+                            on_token(content)
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    continue
+        return full_content, finish_reason
+    except Exception as e:
+        print(f"  [stream] error: {e}")
+        return full_content or f"ERROR: {e}", "error"
+
+
 def call_llm_simple(messages: list, max_tokens: int = 128, url: str = None, stop: list = None) -> str:
     """Simple LLM call without tools — used for critic and reflector."""
     body = {
@@ -1874,16 +1924,17 @@ def needs_decomposition(text: str) -> bool:
     return True  # Default: try AoT for longer/complex queries
 
 
-def run_agent_aot(user_message: str, history: list = None) -> str:
+def run_agent_aot(user_message: str, history: list = None, on_token=None) -> str:
     """
     Atom of Thoughts wrapper: decompose complex tasks, solve atoms independently,
     synthesize results. Falls back to standard agent for simple tasks.
     history: optional list of {"role": "user"|"assistant", "content": "..."} from prior turns.
+    on_token: optional callback(str) for streaming tokens to the UI.
     """
     # Heuristic bypass — skip decomposition for obviously simple queries
     if not needs_decomposition(user_message):
         print(f"  [aot] simple query — skipping decomposition")
-        return run_agent(user_message, history=history)
+        return run_agent(user_message, history=history, on_token=on_token)
 
     print(f"  [aot] decomposing...", end="", flush=True)
     t0 = time.time()
@@ -1892,7 +1943,7 @@ def run_agent_aot(user_message: str, history: list = None) -> str:
 
     # Simple task — run directly
     if len(atoms) <= 1 or "SIMPLE" in atoms:
-        return run_agent(user_message, history=history)
+        return run_agent(user_message, history=history, on_token=on_token)
 
     print(f"  [aot] atoms: {atoms}")
 
@@ -1944,7 +1995,7 @@ class TaskContext:
         'terminal_state', 'tool_cooldowns',
         'reflections_used', 'max_reflections', 'tether_injected', 'tool_nudge_used',
         'pending_calls', 'pending_content', 'approved_calls', 'pending_synthesis',
-        '_continued',
+        '_continued', 'on_token',
     ]
 
     def __init__(self, user_message: str, history: list = None):
@@ -1975,6 +2026,7 @@ class TaskContext:
         self.approved_calls: list[dict] = []
         self.pending_synthesis = ""
         self._continued = False
+        self.on_token = None
 
     def available_tools(self) -> list[dict]:
         """Return TOOLS filtered by cooldowns. Cooled-down tools aren't offered."""
@@ -2127,26 +2179,37 @@ def _sm_select_tool(ctx: TaskContext) -> str:
     budget = MAX_TOKENS_SYNTHESIS if is_synthesis_turn else MAX_TOKENS_TOOL_CALL
     available = ctx.available_tools()
 
-    response = call_llm(
-        ctx.messages,
-        max_tokens=budget,
-        include_tools=not is_synthesis_turn,
-        tools=available if not is_synthesis_turn else None,
-    )
-
-    if "error" in response:
-        print(f" error")
-        ctx.result = f"Error: {response['error']}"
-        ctx.terminal_state = TERMINAL_TOOL_BLOCKED
-        return "DONE"
-
-    choice = response["choices"][0]
-    content = choice["message"].get("content", "")
-    elapsed = time.time() - t0
-    tokens = response.get("usage", {}).get("completion_tokens", "?")
-    total_tokens = response.get("usage", {}).get("total_tokens", 0)
-    autonomy_record_call(tokens_used=total_tokens)
-    print(f" {elapsed:.1f}s ({tokens} tokens)")
+    # ── LLM call: stream synthesis turns when callback available ──
+    finish_reason = "stop"
+    if is_synthesis_turn and ctx.on_token:
+        # Stream tokens directly to UI during synthesis
+        content, finish_reason = call_llm_stream(
+            ctx.messages, max_tokens=budget, on_token=ctx.on_token,
+        )
+        elapsed = time.time() - t0
+        est_tokens = estimate_tokens(content)
+        autonomy_record_call(tokens_used=est_tokens)
+        print(f" streamed {elapsed:.1f}s (~{est_tokens} tok)")
+    else:
+        response = call_llm(
+            ctx.messages,
+            max_tokens=budget,
+            include_tools=not is_synthesis_turn,
+            tools=available if not is_synthesis_turn else None,
+        )
+        if "error" in response:
+            print(f" error")
+            ctx.result = f"Error: {response['error']}"
+            ctx.terminal_state = TERMINAL_TOOL_BLOCKED
+            return "DONE"
+        choice = response["choices"][0]
+        content = choice["message"].get("content", "")
+        finish_reason = choice.get("finish_reason", "stop")
+        elapsed = time.time() - t0
+        tokens = response.get("usage", {}).get("completion_tokens", "?")
+        total_tokens = response.get("usage", {}).get("total_tokens", 0)
+        autonomy_record_call(tokens_used=total_tokens)
+        print(f" {elapsed:.1f}s ({tokens} tokens)")
 
     # ── Stuckness checks ──
     ctx.progress.update_stuckness(False, content)
@@ -2190,7 +2253,6 @@ def _sm_select_tool(ctx: TaskContext) -> str:
         # If the response hit max_tokens, it was cut off mid-thought.
         # Continue once: inject partial as assistant msg, prompt "Continue:",
         # concatenate. Cap at 1 continuation to avoid spirals.
-        finish_reason = choice.get("finish_reason", "stop")
         if finish_reason == "length" and not ctx._continued:
             ctx._continued = True
             ctx.pending_synthesis = content  # stash partial for concatenation
@@ -2483,7 +2545,7 @@ _STATE_HANDLERS = {
 }
 
 
-def run_agent(user_message: str, history: list = None) -> str:
+def run_agent(user_message: str, history: list = None, on_token=None) -> str:
     """
     State machine agent loop (v0.9.0).
 
@@ -2495,6 +2557,7 @@ def run_agent(user_message: str, history: list = None) -> str:
     Terminal states: ANSWER, INSUFFICIENT_EVIDENCE, TOOL_FAILURE_BLOCKING, STALLED.
     """
     ctx = TaskContext(user_message, history=history)
+    ctx.on_token = on_token
     state = "INIT"
 
     while state != "DONE":

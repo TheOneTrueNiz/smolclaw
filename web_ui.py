@@ -438,6 +438,8 @@ HTML_PAGE = """<!DOCTYPE html>
     align-self:flex-start; background:var(--card);
     border:1px solid var(--border); border-bottom-left-radius:3px;
   }
+  .msg.assistant a { color:#58a6ff; text-decoration:underline; word-break:break-all; }
+  .msg.assistant a:hover { color:#79c0ff; }
   .msg.thinking {
     align-self:flex-start; background:var(--card);
     border:1px solid var(--border); color:var(--muted); font-style:italic;
@@ -710,7 +712,7 @@ async function loadConvo(id) {
     if (!convo.messages.length) {
       msgs.innerHTML = '<div class="msg assistant">Hey, I am SmolClaw. I run on three NUCs and think with a 3B brain. Ask me anything.</div>';
     } else {
-      msgs.innerHTML = convo.messages.map(m => `<div class="msg ${m.role}">${esc(m.content)}</div>`).join('');
+      msgs.innerHTML = convo.messages.map(m => `<div class="msg ${m.role}">${m.role === 'assistant' ? linkify(m.content) : esc(m.content)}</div>`).join('');
     }
     msgs.scrollTop = msgs.scrollHeight;
     loadConversations();
@@ -776,7 +778,7 @@ async function sendMsg() {
     const data = await res.json();
     clearInterval(ti);
     thinkDiv.className = 'msg assistant';
-    thinkDiv.textContent = data.response;
+    thinkDiv.innerHTML = linkify(data.response);
     thinkDiv.style.fontStyle = 'normal';
     statusEl.textContent = '';
     loadConversations();
@@ -845,6 +847,11 @@ function closeDrawers() {
 function esc(s) {
   if (!s) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function linkify(s) {
+  // Escape first for XSS safety, then convert URLs to clickable links
+  var safe = esc(s);
+  return safe.replace(/(https?:\/\/[^\s<>"&]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
 }
 
 window.addEventListener('load', init);

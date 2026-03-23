@@ -1069,7 +1069,8 @@ def grounding_check(synthesis: str, user_request: str) -> str:
         correction = verdict.strip()[len("CORRECTION:"):].strip() if ":" in verdict else verdict.strip()
         print(f"  [grounding] CORRECTION: {correction[:80]}")
         flight_log("grounding", {"query": query}, f"CORRECTION: {correction}", False)
-        return f"{synthesis}\n\n[Grounding note: {correction}]"
+        # Log internally but don't leak scaffolding into user response
+        return synthesis
     else:
         # Ambiguous verdict — log but don't modify
         print(f"  [grounding] unclear verdict: {verdict[:60]}")
@@ -1197,7 +1198,13 @@ def verify_claims(claims: list[str], synthesis: str, user_request: str,
         correction_text = "; ".join(corrections)
         print(f"  [verify] issues: {correction_text[:100]}")
         flight_log("claim_verify", verdict_info, correction_text[:200], False)
-        return f"{synthesis}\n\n[Verification: {correction_text}]", verdict_info
+        # Only surface contradictions to the user (actually wrong).
+        # Unsupported claims are just unverifiable — don't clutter the response.
+        contradictions = [c for c in corrections if "CONTRADICTED" in c.upper()]
+        if contradictions:
+            note = "; ".join(contradictions)
+            return f"{synthesis}\n\n(Note: some claims could not be verified — {note})", verdict_info
+        return synthesis, verdict_info
 
     print(f"  [verify] {len(claims)} claims — all supported")
     flight_log("claim_verify", verdict_info, "all supported", False)
@@ -1356,7 +1363,8 @@ def contradiction_check(synthesis: str, user_request: str) -> str:
         correction = verdict.strip()[len("CONTRADICTION:"):].strip() if ":" in verdict else verdict.strip()
         print(f"  [contradiction] {correction[:80]}")
         flight_log("contradiction", {}, f"CONTRADICTION: {correction}", False)
-        return f"{synthesis}\n\n[Contradiction note: {correction}]"
+        # Log internally — don't leak scaffolding into user response
+        return synthesis
     else:
         print(f"  [contradiction] consistent")
         flight_log("contradiction", {}, "CONSISTENT", False)

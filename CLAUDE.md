@@ -15,6 +15,31 @@ SmolClaw runs on a 3-NUC headless cluster. You are editing code on the **hackboo
 | nizbot2 | NUC2 — Critic/grounding | 10.0.0.2 | 100.104.164.38 | nizbot2 |
 | nizbot3 | NUC3 — Memory/recall | 10.0.0.3 | 100.110.49.11 | nizbot3 |
 
+## SSH Access (from hackbook)
+
+SSH keys are set up. Connect to any NUC from the hackbook using Tailscale IPs:
+
+```bash
+ssh nizbot1@100.126.137.93   # NUC1 — Actor, web_ui, llama-server
+ssh nizbot2@100.104.164.38   # NUC2 — Critic
+ssh nizbot3@100.110.49.11    # NUC3 — Memory
+```
+
+SCP for file sync:
+```bash
+scp agent.py agent_hackbook.py web_ui.py nizbot1@100.126.137.93:~/smolclaw/
+```
+
+Check cluster health:
+```bash
+for n in 100.126.137.93 100.104.164.38 100.110.49.11; do curl -s http://$n:8090/health && echo " $n"; done
+```
+
+Watch web_ui logs:
+```bash
+ssh nizbot1@100.126.137.93 "tail -f /tmp/web_ui.log"
+```
+
 ## Two Agent Variants
 
 - **`agent.py`** — LAN IPs (10.0.0.x). Used when web_ui.py runs on nizbot1 directly.

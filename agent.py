@@ -21,7 +21,9 @@ import subprocess
 import os
 import re
 import sys
+import http.client
 import time
+import threading
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -61,9 +63,92 @@ MAX_TOKENS_RECALL = 256      # room for relevant memories
 MAX_TOKENS_CONTRADICTION = 64  # CONSISTENT or CONTRADICTION: ...
 MAX_TOKENS_SUMMARIZE = 200     # conversation summary (NUC3, background)
 
+# Complexity-gated synthesis budgets — save decode time on simple queries
+_SIMPLE_PATTERNS = re.compile(
+    r'^(hi|hello|hey|thanks|thank you|ok|okay|cool|nice|great|sure|bye|goodbye|'
+    r'good morning|good night|how are you|what\'s up|yo|sup|'
+    r'yes|no|yeah|nope|nah|yep|right|got it|understood)\b',
+    re.IGNORECASE,
+)
+_COMPLEX_PATTERNS = re.compile(
+    r'\b(explain|compare|difference|write.*code|write.*script|create.*program|'
+    r'analyze|summarize|describe|list all|how does|why does|step.by.step|'
+    r'pros.and.cons|what are the|tell me about|help me understand)\b',
+    re.IGNORECASE,
+)
+
+def classify_synthesis_budget(query: str) -> int:
+    """Return synthesis token budget based on query complexity.
+    Simple → 96, Normal → 256, Complex → 384."""
+    q = query.strip()
+    if len(q) < 30 and _SIMPLE_PATTERNS.match(q):
+        return 96
+    if len(q) > 60 or _COMPLEX_PATTERNS.search(q):
+        return 384
+    return MAX_TOKENS_SYNTHESIS
+
 # ── Context budget constants (8192 total) ────────────────────────────────────
 SUMMARY_BUDGET = 600           # max tokens for compressed old-history summary
 RECENT_RAW_BUDGET = 1500       # max tokens for recent raw messages
+
+# ── Persistent HTTP connections (keep-alive) ──────────────────────────────
+# Reuse TCP connections to NUC1/2/3 instead of opening a new socket per call.
+# Saves ~2-5ms per call (TCP handshake) and reduces TIME_WAIT socket buildup.
+_conn_pool: dict[str, http.client.HTTPConnection] = {}
+_conn_lock = threading.Lock()
+
+
+def _get_conn(url: str) -> tuple[http.client.HTTPConnection, str]:
+    """Get or create a persistent HTTP connection for a URL.
+    Returns (connection, path). Thread-safe with automatic reconnect."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host_key = f"{parsed.hostname}:{parsed.port or 80}"
+    path = parsed.path or "/"
+
+    with _conn_lock:
+        conn = _conn_pool.get(host_key)
+        if conn is None:
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80,
+                                               timeout=900)
+            _conn_pool[host_key] = conn
+    return conn, path
+
+
+def _http_post(url: str, payload: bytes, timeout: int = 900, stream: bool = False):
+    """HTTP POST with persistent connection. Falls back to urllib on failure."""
+    conn, path = _get_conn(url)
+    headers = {"Content-Type": "application/json", "Connection": "keep-alive"}
+    try:
+        conn.request("POST", path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        if stream:
+            return resp  # caller reads lines
+        data = resp.read()
+        return json.loads(data)
+    except (http.client.RemoteDisconnected, ConnectionError, OSError, TimeoutError):
+        # Connection went stale — reconnect once
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host_key = f"{parsed.hostname}:{parsed.port or 80}"
+        with _conn_lock:
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80,
+                                               timeout=timeout)
+            _conn_pool[host_key] = conn
+        try:
+            conn.request("POST", path, body=payload, headers=headers)
+            resp = conn.getresponse()
+            if stream:
+                return resp
+            data = resp.read()
+            return json.loads(data)
+        except Exception as e:
+            # Final fallback: one-shot urllib (no keep-alive)
+            req = urllib.request.Request(url, data=payload, headers=headers)
+            if stream:
+                return urllib.request.urlopen(req, timeout=timeout)  # caller closes
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
 
 
 def estimate_tokens(text: str) -> int:
@@ -287,6 +372,55 @@ How I work:
 - I NEVER describe steps to use tools like web_search or shell as part of my answer. If I need information, I use the tool silently and report the result. I never tell the user to run commands or search for things — I do it myself or just answer from what I know.
 - Shell tips: I use SINGLE QUOTES for patterns: grep 'pattern' file, find . -name '*.py'. I use short flags (-h not --human-readable). I use python3 not python. To count matches: grep -c 'pattern' file.
 """
+
+# ── Few-shot library (mined from flight recorder successes) ─────────────
+# Inject 1-2 relevant examples into system prompt when non-obvious tools
+# are in the filtered set. web_search and shell already have static examples.
+# ~40-60 tokens per example — within context budget.
+FEW_SHOT_EXAMPLES = {
+    "recall": (
+        "What do you know about me?",
+        '<tool_call>\n{"name": "recall", "arguments": {}}\n</tool_call>',
+    ),
+    "remember": (
+        "Remember that my cat's name is Luna.",
+        '<tool_call>\n{"name": "remember", "arguments": {"note": "User\'s cat is named Luna"}}\n</tool_call>',
+    ),
+    "read_file": (
+        "What's in the roadmap file?",
+        '<tool_call>\n{"name": "read_file", "arguments": {"path": "/home/nizbot1/smolclaw/ROADMAP.md"}}\n</tool_call>',
+    ),
+    "write_file": (
+        "Create a file at /tmp/hello.txt that says hello world.",
+        '<tool_call>\n{"name": "write_file", "arguments": {"path": "/tmp/hello.txt", "content": "hello world"}}\n</tool_call>',
+    ),
+    "scratchpad": (
+        "Show me that previous command output.",
+        '<tool_call>\n{"name": "scratchpad", "arguments": {"name": "shell_output"}}\n</tool_call>',
+    ),
+}
+
+# Tools already exemplified in static SYSTEM_PROMPT — skip these
+_STATIC_EXAMPLES = {"web_search", "shell"}
+
+
+def build_few_shot_suffix(filtered_tools: list) -> str:
+    """Build a few-shot suffix for the system prompt based on filtered tools.
+    Returns empty string if no new examples needed."""
+    tool_names = {t["function"]["name"] for t in filtered_tools}
+    examples = []
+    for name in tool_names:
+        if name in _STATIC_EXAMPLES:
+            continue
+        ex = FEW_SHOT_EXAMPLES.get(name)
+        if ex:
+            examples.append(f"User: \"{ex[0]}\"\n{ex[1]}")
+        if len(examples) >= 2:
+            break
+    if not examples:
+        return ""
+    return "\n\nMore tool examples:\n" + "\n\n".join(examples)
+
 
 CRITIC_PROMPT = """/no_think
 I am SmolClaw's adversarial critic. I judge risk by action class, not just tool name.
@@ -1723,14 +1857,8 @@ def call_llm(messages: list, max_tokens: int = None, temperature: float = None,
     if include_tools:
         body["tools"] = tools if tools is not None else TOOLS
     payload = json.dumps(body).encode()
-
-    req = urllib.request.Request(
-        LLAMA_URL, data=payload,
-        headers={"Content-Type": "application/json"},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=900) as resp:
-            return json.loads(resp.read())
+        return _http_post(LLAMA_URL, payload)
     except Exception as e:
         return {"error": str(e)}
 
@@ -1748,38 +1876,34 @@ def call_llm_stream(messages: list, max_tokens: int = None, temperature: float =
         "stream": True,
     }
     payload = json.dumps(body).encode()
-    req = urllib.request.Request(
-        LLAMA_URL, data=payload,
-        headers={"Content-Type": "application/json"},
-    )
     full_content = ""
     finish_reason = "stop"
     try:
-        with urllib.request.urlopen(req, timeout=900) as resp:
-            while True:
-                line = resp.readline()
-                if not line:
-                    break
-                line = line.decode("utf-8").strip()
-                if not line or not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    choice = chunk.get("choices", [{}])[0]
-                    delta = choice.get("delta", {})
-                    content = delta.get("content", "")
-                    fr = choice.get("finish_reason")
-                    if fr:
-                        finish_reason = fr
-                    if content:
-                        full_content += content
-                        if on_token:
-                            on_token(content)
-                except (json.JSONDecodeError, IndexError, KeyError):
-                    continue
+        resp = _http_post(LLAMA_URL, payload, stream=True)
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            line = line.decode("utf-8").strip()
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                choice = chunk.get("choices", [{}])[0]
+                delta = choice.get("delta", {})
+                content = delta.get("content", "")
+                fr = choice.get("finish_reason")
+                if fr:
+                    finish_reason = fr
+                if content:
+                    full_content += content
+                    if on_token:
+                        on_token(content)
+            except (json.JSONDecodeError, IndexError, KeyError):
+                continue
         return full_content, finish_reason
     except Exception as e:
         print(f"  [stream] error: {e}")
@@ -1797,17 +1921,11 @@ def call_llm_simple(messages: list, max_tokens: int = 128, url: str = None, stop
     if stop:
         body["stop"] = stop
     payload = json.dumps(body).encode()
-
-    req = urllib.request.Request(
-        url or LLAMA_URL, data=payload,
-        headers={"Content-Type": "application/json"},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            data = json.loads(resp.read())
-            content = data["choices"][0]["message"].get("content", "")
-            # Strip think blocks
-            return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        data = _http_post(url or LLAMA_URL, payload, timeout=300)
+        content = data["choices"][0]["message"].get("content", "")
+        # Strip think blocks
+        return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -2102,7 +2220,7 @@ class TaskContext:
         'terminal_state', 'tool_cooldowns',
         'reflections_used', 'max_reflections', 'tether_injected', 'tool_nudge_used',
         'pending_calls', 'pending_content', 'approved_calls', 'pending_synthesis',
-        '_continued', 'on_token',
+        '_continued', 'on_token', 'synthesis_budget',
     ]
 
     def __init__(self, user_message: str, history: list = None):
@@ -2135,6 +2253,7 @@ class TaskContext:
         self.pending_synthesis = ""
         self._continued = False
         self.on_token = None
+        self.synthesis_budget = classify_synthesis_budget(user_message)
 
     def available_tools(self) -> list[dict]:
         """Return tools filtered by relevance + cooldowns. Shrinks prompt."""
@@ -2240,9 +2359,17 @@ def _sm_init(ctx: TaskContext) -> str:
     if reason != "ok":
         print(f"  [autonomy] {reason}")
 
+    # Build system prompt with dynamic few-shot examples
+    filtered = filter_tools(ctx.goal)
+    few_shot = build_few_shot_suffix(filtered)
     ctx.messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": SYSTEM_PROMPT + few_shot},
     ]
+    if few_shot:
+        print(f"  [few-shot] injected {few_shot.count('tool_call')} example(s)")
+    if ctx.synthesis_budget != MAX_TOKENS_SYNTHESIS:
+        label = "simple" if ctx.synthesis_budget < MAX_TOKENS_SYNTHESIS else "complex"
+        print(f"  [budget] {label} query → synthesis {ctx.synthesis_budget} tokens")
     # Inject conversation history (assembled by web_ui: summary + recent raw)
     if ctx.history:
         for turn in ctx.history:
@@ -2295,7 +2422,7 @@ def _sm_select_tool(ctx: TaskContext) -> str:
 
     # On potential synthesis turns, skip tool defs to save ~490 prompt tokens
     is_synthesis_turn = ctx.has_tool_results
-    budget = MAX_TOKENS_SYNTHESIS if is_synthesis_turn else MAX_TOKENS_TOOL_CALL
+    budget = ctx.synthesis_budget if is_synthesis_turn else MAX_TOKENS_TOOL_CALL
     available = ctx.available_tools()
 
     # ── LLM call: stream synthesis turns when callback available ──

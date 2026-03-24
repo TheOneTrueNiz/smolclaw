@@ -181,6 +181,55 @@ TOOLS = [
     }
 ]
 
+# ── Dynamic Tool Filtering ─────────────────────────────────────────────────
+# Only inject 2-4 relevant tools per query. Saves ~300 prompt tokens.
+
+_TOOL_KEYWORDS = {
+    "shell": {"run", "command", "execute", "check", "process", "disk", "uptime",
+              "install", "system", "service", "ping", "cpu", "memory", "ram", "df",
+              "ls", "grep", "restart", "kill", "port", "network"},
+    "read_file": {"read", "file", "look", "show", "cat", "content", "code",
+                  "config", "log", "open", "view", "source"},
+    "write_file": {"write", "file", "create", "save", "output", "note", "make"},
+    "remember": {"remember", "store", "keep", "note", "save", "don't forget"},
+    "recall": {"recall", "memory", "memories", "told", "earlier", "last time",
+               "you know", "we discussed"},
+    "scratchpad": {"scratchpad", "scratch", "previous", "large output", "stash"},
+    "web_search": {"search", "who", "what", "when", "where", "current", "latest",
+                   "news", "president", "population", "version", "death", "died",
+                   "born", "election", "how many", "how old", "movie", "actor",
+                   "weather", "score", "price", "release"},
+}
+
+_TOOL_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
+
+def filter_tools(query: str, min_tools: int = 2, max_tools: int = 4) -> list:
+    """Return only the most relevant tools for this query. Shrinks prompt."""
+    q_lower = query.lower()
+    q_words = set(q_lower.split())
+    scores = {}
+    for tool_name, keywords in _TOOL_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in q_lower)
+        # Bonus for exact word match
+        score += sum(0.5 for kw in keywords if kw in q_words)
+        scores[tool_name] = score
+    # Sort by score descending
+    ranked = sorted(scores.items(), key=lambda x: -x[1])
+    # Always include at least the top scorers
+    selected = set()
+    for name, score in ranked:
+        if score > 0 or len(selected) < min_tools:
+            selected.add(name)
+        if len(selected) >= max_tools:
+            break
+    # Ensure we always have at least min_tools
+    for name, _ in ranked:
+        if len(selected) >= min_tools:
+            break
+        selected.add(name)
+    return [_TOOL_BY_NAME[n] for n in selected if n in _TOOL_BY_NAME]
+
+
 # ── Safety ──────────────────────────────────────────────────────────────────
 
 BLOCKED_COMMANDS = [
@@ -220,12 +269,15 @@ When shell output is large, it gets saved to my scratchpad automatically. I use 
 
 How I work:
 - I respond in English. I am conversational but concise — I give real answers with personality, not search results.
-- I act first, explain after. I call tools IMMEDIATELY — never narrate what I'm about to do.
+- NOT every message needs a tool. When the user is chatting, joking, sharing opinions, making plans, or saying thanks, I just TALK. Tools are for factual questions and real tasks — not casual conversation.
+- When I DO need a tool, I act first, explain after. I call tools IMMEDIATELY — never narrate what I'm about to do.
 - I pick the right tool instinctively: shell for commands, remember for memory, write_file for files, scratchpad to retrieve large outputs.
 - I do not use sudo. I run as user nizbot1.
 - I do not install packages or do things I wasn't asked to do.
 - When a tool fails, I think about WHY and try a DIFFERENT approach. I never repeat the same failing command.
 - I stay focused on exactly what was asked. I do not repeat tool output verbatim — I summarize the key facts.
+- GROUNDING RULE: When I use web_search, my answer must ONLY contain facts from the search results. I NEVER invent titles, names, dates, or details that are not in the results. If the results don't cover something, I say so — I do not guess or fill in gaps with made-up information.
+- I NEVER describe steps to use tools like web_search or shell as part of my answer. If I need information, I use the tool silently and report the result. I never tell the user to run commands or search for things — I do it myself or just answer from what I know.
 - Shell tips: I use SINGLE QUOTES for patterns: grep 'pattern' file, find . -name '*.py'. I use short flags (-h not --human-readable). I use python3 not python. To count matches: grep -c 'pattern' file.
 """
 
@@ -766,7 +818,7 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
             if not results:
                 return f"No results found for: {query}", False
             # Format results as readable text for the 3B model
-            lines = []
+            lines = ["[SEARCH RESULTS — use ONLY these facts in your answer. Do NOT add details not found here.]"]
             for i, r in enumerate(results, 1):
                 lines.append(f"{i}. {r['title']}")
                 lines.append(f"   {r['snippet']}")
@@ -1181,33 +1233,31 @@ def verify_claims(claims: list[str], synthesis: str, user_request: str,
     )
 
     # Parse structured verdicts — count by category
-    corrections = []
+    # Use prefix matching (e.g. "2. CONTRADICTED:") to avoid false positives
+    # from the word appearing in explanation text
     for line in verdict.split("\n"):
-        line_upper = line.strip().upper()
-        if "CONTRADICTED" in line_upper:
+        stripped = line.strip()
+        # Match "N. VERDICT" or just "VERDICT:" at start of line
+        verdict_prefix = re.match(r'(?:\d+\.\s*)?(\w+)', stripped)
+        if not verdict_prefix:
+            continue
+        category = verdict_prefix.group(1).upper()
+        if category == "CONTRADICTED":
             verdict_info["contradicted"] += 1
-            corrections.append(line.strip())
-        elif "UNSUPPORTED" in line_upper:
+        elif category == "UNSUPPORTED":
             verdict_info["unsupported"] += 1
-            if not had_tool_results:
-                corrections.append(line.strip())
-        elif "SUPPORTED" in line_upper:
+        elif category == "SUPPORTED":
             verdict_info["supported"] += 1
 
-    if corrections:
-        correction_text = "; ".join(corrections)
-        print(f"  [verify] issues: {correction_text[:100]}")
-        flight_log("claim_verify", verdict_info, correction_text[:200], False)
-        # Only surface contradictions to the user (actually wrong).
-        # Unsupported claims are just unverifiable — don't clutter the response.
-        contradictions = [c for c in corrections if "CONTRADICTED" in c.upper()]
-        if contradictions:
-            note = "; ".join(contradictions)
-            return f"{synthesis}\n\n(Note: some claims could not be verified — {note})", verdict_info
-        return synthesis, verdict_info
+    # Log internally — never leak raw verdict text into user response
+    if verdict_info["contradicted"] > 0 or verdict_info["unsupported"] > 0:
+        print(f"  [verify] issues: {verdict_info['contradicted']} contradicted, "
+              f"{verdict_info['unsupported']} unsupported")
+        flight_log("claim_verify", verdict_info, verdict[:200], False)
+    else:
+        print(f"  [verify] {len(claims)} claims — all supported")
+        flight_log("claim_verify", verdict_info, "all supported", False)
 
-    print(f"  [verify] {len(claims)} claims — all supported")
-    flight_log("claim_verify", verdict_info, "all supported", False)
     return synthesis, verdict_info
 
 
@@ -1622,6 +1672,7 @@ def call_llm(messages: list, max_tokens: int = None, temperature: float = None,
         "messages": messages,
         "temperature": temperature or TEMPERATURE,
         "max_tokens": max_tokens or MAX_TOKENS_TOOL_CALL,
+        "frequency_penalty": 0.3,
     }
     if include_tools:
         body["tools"] = tools if tools is not None else TOOLS
@@ -1647,6 +1698,7 @@ def call_llm_stream(messages: list, max_tokens: int = None, temperature: float =
         "messages": messages,
         "temperature": temperature or TEMPERATURE,
         "max_tokens": max_tokens or MAX_TOKENS_SYNTHESIS,
+        "frequency_penalty": 0.3,
         "stream": True,
     }
     payload = json.dumps(body).encode()
@@ -1782,11 +1834,17 @@ def critic_check(tool_call: dict, user_request: str) -> tuple[str, str]:
 SAFE_TOOLS = {"recall", "scratchpad", "web_search", "remember"}
 SAFE_SHELL_PREFIXES = (
     "uptime", "df ", "df\n", "free ", "free\n", "uname ", "whoami", "hostname",
-    "date", "cat ", "ls ", "ls\n", "head ", "wc ", "du ", "ps ", "ps\n",
+    "date", "cat ", "ls ", "ls\n", "head ", "tail ", "wc ", "du ", "ps ", "ps\n",
     "grep ", "find ", "pwd", "id", "echo ", "ping ", "top ", "top\n",
+    "which ", "type ", "file ", "stat ", "lsof ", "ss ", "ip addr", "ip route",
+    "env", "printenv", "lsblk", "lscpu", "nproc", "arch",
+    "python3 -c", "python3 --version", "pip3 list", "pip3 show",
+    "git log", "git status", "git diff", "git branch", "git show",
+    "systemctl status", "journalctl",
     "curl 10.0.0.", "curl 100.",  # internal cluster IPs — always safe
     "curl http://10.0.0.", "curl http://100.",  # with scheme prefix
     "curl -s 10.0.0.", "curl -s http://10.0.0.",  # with -s flag
+    "curl http://127.0.0.1", "curl -s http://127.0.0.1",  # localhost
 )
 # Tier 0 — ephemeral write zones (always safe for write_file)
 SAFE_WRITE_ZONES = (
@@ -2029,8 +2087,9 @@ class TaskContext:
         self.on_token = None
 
     def available_tools(self) -> list[dict]:
-        """Return TOOLS filtered by cooldowns. Cooled-down tools aren't offered."""
-        return [t for t in TOOLS
+        """Return tools filtered by relevance + cooldowns. Shrinks prompt."""
+        relevant = filter_tools(self.goal)
+        return [t for t in relevant
                 if self.tool_cooldowns.get(t["function"]["name"], 0) <= 0]
 
     def tick_cooldowns(self):

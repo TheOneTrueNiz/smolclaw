@@ -197,14 +197,15 @@ Measured on the 3-NUC cluster with SmolLM3-3B Q4_K_M:
 | Metric | Value |
 |--------|-------|
 | Prefill (NUC1, prompt cached) | 10-15 tokens/s |
-| Decode (NUC1, 1 slot) | 2.5-4.3 tokens/s |
-| Decode (NUC2, 1 slot) | 9.3 tokens/s |
+| Decode (NUC1, 1 slot, 2 threads) | 5.7-6.0 tokens/s |
+| Decode (NUC2, 1 slot, 4 threads+BLAS) | 7.5-8.0 tokens/s |
 | AoT decompose (NUC2) | 5.1s |
 | Critic — whitelisted ops | 0.0s (skipped) |
 | Critic — non-whitelisted | 4-10s |
 | Typical simple query end-to-end | 60-120s |
 | Typical multi-step query end-to-end | 120-300s |
-| RAM usage per NUC | ~1-2GB (model + KV cache) |
+| RAM per NUC (server RSS) | ~3.3GB (model 1.8GB + KV cache + scratch) |
+| RAM free per NUC | ~10GB of 16GB available |
 
 ### Latency Optimizations Applied
 
@@ -212,10 +213,17 @@ Measured on the 3-NUC cluster with SmolLM3-3B Q4_K_M:
 - **Stop sequences** — critic, decompose, reflect all stop at `\n` instead of generating padding
 - **NUC2 offload** — decompose + reflect run on NUC2 at 9.3 t/s instead of NUC1 at 2.5 t/s
 - **NUC3 offload** — memory recall + reflection run on dedicated NUC3
-- **Critic whitelist** — safe read-only ops skip the critic entirely (saves 4-10s per call)
+- **Critic whitelist** — expanded set of safe read-only ops skip the critic entirely (saves 4-10s per call)
 - **Single slot** — `--parallel 1` on NUC1 eliminates KV cache splitting overhead
 - **Tools-free synthesis** — tool definitions (~405 tokens) omitted on the final answer turn
 - **Token budgets** — tool calls: 160, critic: 32, reflect: 64, synthesis: 150
+- **Dynamic tool filtering** — only 2-4 relevant tools injected per query (saves ~300 prompt tokens)
+- **SSE streaming** — synthesis tokens stream to web UI in real-time via Server-Sent Events
+- **Broadwell-optimized build** — llama.cpp compiled with AVX2+FMA+F16C, flash-attn, KV cache quantization (q8_0/q4_0)
+- **HT-aware threading** — 2 threads on NUC1 (no BLAS) avoids hyperthreading contention; 4 threads on NUC2/3 (BLAS manages HT)
+- **CPU governor** — `performance` mode + `nice -10` priority for llama-server on all nodes
+- **Frequency penalty** — 0.3 penalty reduces intra-response repetition from the 3B model
+- **Grounding rules** — search results anchored with explicit "use ONLY these facts" prefix
 
 ---
 

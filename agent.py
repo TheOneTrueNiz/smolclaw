@@ -1046,18 +1046,35 @@ Verdict:"""
 
 MAX_TOKENS_GROUNDING = 64
 
-def needs_grounding(synthesis: str, had_tool_results: bool) -> bool:
-    """Heuristic: should we ground this answer with web search?"""
+def needs_grounding(synthesis: str, had_tool_results: bool,
+                    tools_used: set = None) -> bool:
+    """Heuristic: should we ground this answer with web search?
+
+    Key insight: if the synthesis is just summarising tool output
+    (shell, read_file, scratchpad), the facts came from tools — not
+    the model's weights.  Grinding that through 2 NUC2 verification
+    calls is pure waste.  Only ground when the model is generating
+    factual claims from its own knowledge.
+    """
     if not BRAVE_API_KEY:
         return False
-    # Very short answers are usually tool-output summaries — skip
+    # Very short answers — skip
     if len(synthesis) < 40:
         return False
     # Error/abort messages — skip
     if synthesis.startswith(("Error:", "Autonomy kernel", "I hit too many", "Partial results")):
         return False
-    # If the agent used tools, the answer is likely grounded in tool output already
-    # Only ground if the answer is long enough to contain unsupported claims
+
+    # ── Fast-path: tool-backed answers skip grounding entirely ──
+    # If the agent used data-producing tools, the synthesis is
+    # summarising their output — nothing to hallucinate.
+    DATA_TOOLS = {"shell", "read_file", "scratchpad", "web_search"}
+    if had_tool_results and tools_used:
+        if tools_used & DATA_TOOLS:
+            print(f"  [grounding] skipped — answer backed by tool output ({tools_used & DATA_TOOLS})")
+            return False
+
+    # Fallback: if tools were used but we don't know which, use length heuristic
     if had_tool_results and len(synthesis) < 200:
         return False
     return True
@@ -1210,11 +1227,21 @@ def verify_claims(claims: list[str], synthesis: str, user_request: str,
                 evidence_parts.append(f"Web: {r['title']} — {r['snippet'][:120]}")
         print(f" ({len(results)} results)")
 
-    # Memory evidence
+    # Memory evidence — pre-filter by claim keywords (don't send raw blob)
     if MEMORY_FILE.exists():
         memories = MEMORY_FILE.read_text().strip()
         if memories and len(memories) > 50:
-            evidence_parts.append(f"Memory: {memories[:400]}")
+            entries = _split_memories(memories)
+            claim_text = " ".join(claims).lower()
+            relevant = [e for e in entries
+                        if any(w in e.get("text", e.get("raw", "")).lower()
+                               for w in claim_text.split() if len(w) > 3)]
+            if relevant:
+                filtered_mem = "\n".join(e["raw"] for e in relevant[:5])
+                evidence_parts.append(f"Memory: {filtered_mem[:300]}")
+            elif len(memories) < 200:
+                # Tiny memory — send all
+                evidence_parts.append(f"Memory: {memories[:200]}")
 
     if not evidence_parts:
         print(f"  [verify] no evidence available — skipping")
@@ -2049,7 +2076,7 @@ class TaskContext:
     """
     __slots__ = [
         'task_id', 'goal', 'history', 'budget', 'turns_used', 'messages', 'progress',
-        'seen_commands', 'consecutive_errors', 'has_tool_results', 'result',
+        'seen_commands', 'consecutive_errors', 'has_tool_results', 'tools_used', 'result',
         'terminal_state', 'tool_cooldowns',
         'reflections_used', 'max_reflections', 'tether_injected', 'tool_nudge_used',
         'pending_calls', 'pending_content', 'approved_calls', 'pending_synthesis',
@@ -2067,6 +2094,7 @@ class TaskContext:
         self.seen_commands: set[str] = set()
         self.consecutive_errors = 0
         self.has_tool_results = False
+        self.tools_used: set[str] = set()    # which tools actually ran successfully
         self.result = ""
         self.terminal_state = None
         # Tool discipline — cooldowns after repeated failure
@@ -2451,6 +2479,7 @@ def _sm_execute(ctx: TaskContext) -> str:
                         autonomy_record_call(is_error=False)
                         ctx.consecutive_errors = 0
                         ctx.has_tool_results = True
+                        ctx.tools_used.add("read_file")
                         ctx.progress.record_success(name, args, fb_result)
                         ctx.messages.append({"role": "tool", "content": json.dumps({
                             "name": name,
@@ -2501,6 +2530,7 @@ def _sm_execute(ctx: TaskContext) -> str:
             autonomy_record_call(is_error=False)
             ctx.consecutive_errors = 0
             ctx.has_tool_results = True
+            ctx.tools_used.add(name)
             ctx.progress.record_success(name, args, result)
             # Auto-record significant results as episodic observations
             if len(result) > 30 and name not in ("scratchpad", "recall"):
@@ -2571,7 +2601,7 @@ def _sm_synthesize(ctx: TaskContext) -> str:
 
     # ── Claim Decomposition (replaces grounding + contradiction) ──
     verdict_info = None
-    if needs_grounding(clean, ctx.has_tool_results):
+    if needs_grounding(clean, ctx.has_tool_results, ctx.tools_used):
         print(f"  [verify] extracting claims...")
         claims = extract_claims(clean)
         if claims:

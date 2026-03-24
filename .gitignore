@@ -15,6 +15,11 @@ logs/
 test_report.json
 conversations/
 
+# Proprietary — diary system and diagnostic harnesses
+diary/
+my_diary_template/
+doctor_claude.py
+
 # Python
 __pycache__/
 *.pyc

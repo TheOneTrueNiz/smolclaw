@@ -275,7 +275,7 @@ When shell output is large, it gets saved to my scratchpad automatically. I use 
 
 How I work:
 - I respond in English. I am conversational but concise — I give real answers with personality, not search results.
-- NOT every message needs a tool. When the user is chatting, joking, sharing opinions, making plans, or saying thanks, I just TALK. Tools are for factual questions and real tasks — not casual conversation.
+- NOT every message needs a tool. When the user is chatting, joking, sharing opinions, making plans, saying thanks, asking simple math, or telling jokes, I just TALK. Tools are for factual questions and real tasks — not casual conversation or basic arithmetic.
 - When I DO need a tool, I act first, explain after. I call tools IMMEDIATELY — never narrate what I'm about to do.
 - I pick the right tool instinctively: shell for commands, remember to STORE new facts, recall to RETRIEVE what I know about something, write_file for files, scratchpad to retrieve large outputs.
 - When the user asks "what do you remember", "what do you know about me", or "do you recall" — I use the recall tool FIRST.
@@ -1820,6 +1820,9 @@ def repair_json_str(s: str) -> str:
     s = re.sub(r'"(\*\.[a-zA-Z]+)"', r"'\1'", s)
     # Fix: shell-escaped $ in awk/sed (invalid JSON escape): \$2 → $2
     s = s.replace('\\$', '$')
+    # Fix: any invalid JSON escape sequences (\; \> \{ etc.) → strip the backslash
+    # Valid JSON escapes: \" \\ \/ \b \f \n \r \t \uXXXX
+    s = re.sub(r'\\([^"\\/bfnrtu])', r'\1', s)
     return s
 
 def parse_tool_calls(content: str) -> list:
@@ -2251,9 +2254,12 @@ def _sm_init(ctx: TaskContext) -> str:
     # Pre-nudge: for queries with obvious tool intent, inject a hint
     # so the 3B model doesn't waste a full turn generating text first
     _gl = ctx.goal.lower()
-    if re.search(r'(you remember|do you recall|what do you know about)', _gl):
+    if re.search(r'(you remember|do you recall|what do you know about|did i tell you|i told you|i mentioned|earlier.*about)', _gl):
         ctx.messages.append({"role": "user", "content": "[HINT] Use the recall tool to check your memories."})
         print(f"  [pre-nudge] recall intent detected")
+    elif re.search(r'^\s*what\s+is\s+\d+\s*(times|plus|minus|divided|x|\+|-|\*|/)\s*\d+', _gl):
+        ctx.messages.append({"role": "user", "content": "[HINT] This is simple math. Just calculate the answer — no tool needed."})
+        print(f"  [pre-nudge] simple math — no tool")
     return "SELECT_TOOL"
 
 
@@ -2355,6 +2361,7 @@ def _sm_select_tool(ctx: TaskContext) -> str:
                 and not ctx.tool_nudge_used
                 and re.search(r'\b(check|verify|confirm|run:|grep |what\b.*\b(model|version|population)|'
                               r'you remember|do you recall|what do you know|'
+                              r'did i tell|i told you|i mentioned|earlier.*about|'
                               r'what\b.*\b(files?|disk|uptime|memory usage|process))\b',
                               ctx.goal.lower())):
             ctx.tool_nudge_used = True

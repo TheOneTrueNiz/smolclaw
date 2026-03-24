@@ -1,0 +1,73 @@
+{
+  "name": "Core Tools",
+  "description": "One lesson per tool \u2014 single-tool mastery for all 7 tools",
+  "lessons": [
+    {
+      "id": "tool_shell_ls",
+      "prompt": "List the files in /tmp and tell me how many there are.",
+      "expected_tools_any": [
+        "shell"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "tool_shell_df",
+      "prompt": "How much disk space is free on this machine?",
+      "expected_tools_any": [
+        "shell"
+      ],
+      "validation": "tool_and_behavioral",
+      "pass_keywords": [
+        "GB"
+      ],
+      "timeout": 300
+    },
+    {
+      "id": "tool_read_file",
+      "prompt": "Read the file /etc/hostname and tell me what it says.",
+      "expected_tools_any": [
+        "read_file",
+        "shell"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "tool_write_file",
+      "prompt": "Write a file at /tmp/smolclaw_curriculum_test.txt with the content 'SmolClaw was here'.",
+      "expected_tools_any": [
+        "write_file"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "tool_remember",
+      "prompt": "Remember that the sky is blue and water is wet.",
+      "expected_tools_any": [
+        "remember"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "tool_recall",
+      "prompt": "What do you remember? What's in your memory?",
+      "expected_tools_any": [
+        "recall"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "tool_web_search",
+      "prompt": "Search the web for the current population of Tokyo.",
+      "expected_tools_any": [
+        "web_search"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    }
+  ]
+}

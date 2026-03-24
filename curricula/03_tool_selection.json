@@ -1,0 +1,61 @@
+{
+  "name": "Tool Selection",
+  "description": "Right tool for the job \u2014 does SmolClaw pick correctly and show restraint?",
+  "lessons": [
+    {
+      "id": "select_shell_for_process",
+      "prompt": "What processes are using the most CPU right now?",
+      "expected_tools_any": [
+        "shell"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "select_read_for_config",
+      "prompt": "Show me the contents of /etc/os-release.",
+      "expected_tools_any": [
+        "read_file",
+        "shell"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "select_search_for_facts",
+      "prompt": "Who won the most recent Super Bowl?",
+      "expected_tools_any": [
+        "web_search"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "select_none_for_math",
+      "prompt": "What is 42 times 17?",
+      "expected_tools_any": [],
+      "validation": "tool_and_behavioral",
+      "pass_keywords": [
+        "714"
+      ],
+      "timeout": 300
+    },
+    {
+      "id": "select_none_for_chat",
+      "prompt": "What's the meaning of life?",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": [],
+      "timeout": 300
+    },
+    {
+      "id": "select_recall_for_memory",
+      "prompt": "Did I tell you anything about colors earlier?",
+      "expected_tools_any": [
+        "recall"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    }
+  ]
+}

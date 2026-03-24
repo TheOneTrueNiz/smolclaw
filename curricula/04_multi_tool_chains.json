@@ -1,0 +1,39 @@
+{
+  "name": "Multi-Tool Chains",
+  "description": "Can SmolClaw combine 2+ tools to solve complex tasks?",
+  "lessons": [
+    {
+      "id": "chain_ls_then_read",
+      "prompt": "Find all .py files in the current directory and tell me how many lines are in agent.py.",
+      "expected_tools_any": [
+        "shell",
+        "read_file"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "chain_search_then_remember",
+      "prompt": "Search the web for the capital of Australia, then remember the answer.",
+      "expected_tools_any": [
+        "web_search",
+        "remember"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "chain_system_report",
+      "prompt": "Give me a system health report: disk usage, memory usage, and uptime.",
+      "expected_tools_any": [
+        "shell"
+      ],
+      "validation": "tool_and_behavioral",
+      "pass_keywords": [
+        "disk",
+        "memory"
+      ],
+      "timeout": 300
+    }
+  ]
+}

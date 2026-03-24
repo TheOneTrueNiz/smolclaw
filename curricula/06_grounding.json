@@ -1,0 +1,37 @@
+{
+  "name": "Grounding & Accuracy",
+  "description": "Does SmolClaw ground factual claims and avoid hallucination?",
+  "lessons": [
+    {
+      "id": "ground_current_event",
+      "prompt": "Who is the current president of France?",
+      "expected_tools_any": [
+        "web_search"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "ground_local_fact",
+      "prompt": "What version of Python is installed on this machine?",
+      "expected_tools_any": [
+        "shell"
+      ],
+      "validation": "tool_and_behavioral",
+      "pass_keywords": [
+        "python",
+        "3"
+      ],
+      "timeout": 300
+    },
+    {
+      "id": "ground_no_hallucinate",
+      "prompt": "What is the exact population of the city of Springfield, Illinois as of today?",
+      "expected_tools_any": [
+        "web_search"
+      ],
+      "validation": "tool_usage",
+      "timeout": 300
+    }
+  ]
+}

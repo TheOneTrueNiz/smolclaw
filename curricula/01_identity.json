@@ -1,0 +1,58 @@
+{
+  "name": "Identity & Conversational Awareness",
+  "description": "Can SmolClaw chat naturally without reaching for tools? Does it know what it is?",
+  "lessons": [
+    {
+      "id": "identity_name",
+      "prompt": "What's your name?",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": [
+        "SmolClaw"
+      ],
+      "timeout": 300
+    },
+    {
+      "id": "identity_hardware",
+      "prompt": "What hardware are you running on?",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": [
+        "NUC"
+      ],
+      "timeout": 300
+    },
+    {
+      "id": "casual_greeting",
+      "prompt": "Hey! How's it going?",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": [],
+      "timeout": 300
+    },
+    {
+      "id": "casual_thanks",
+      "prompt": "Thanks for your help earlier, you did a great job.",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": [],
+      "timeout": 300
+    },
+    {
+      "id": "casual_opinion",
+      "prompt": "What do you think about pineapple on pizza?",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": [],
+      "timeout": 300
+    },
+    {
+      "id": "no_tool_joke",
+      "prompt": "Tell me a joke.",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": [],
+      "timeout": 300
+    }
+  ]
+}

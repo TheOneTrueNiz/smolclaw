@@ -193,7 +193,8 @@ _TOOL_KEYWORDS = {
     "write_file": {"write", "file", "create", "save", "output", "note", "make"},
     "remember": {"remember", "store", "keep", "note", "save", "don't forget"},
     "recall": {"recall", "memory", "memories", "told", "earlier", "last time",
-               "you know", "we discussed"},
+               "you know", "we discussed", "you remember", "do you know about",
+               "what do you know"},
     "scratchpad": {"scratchpad", "scratch", "previous", "large output", "stash"},
     "web_search": {"search", "who", "what", "when", "where", "current", "latest",
                    "news", "president", "population", "version", "death", "died",
@@ -213,6 +214,11 @@ def filter_tools(query: str, min_tools: int = 2, max_tools: int = 4) -> list:
         # Bonus for exact word match
         score += sum(0.5 for kw in keywords if kw in q_words)
         scores[tool_name] = score
+    # Disambiguate: "what do you remember" / "do you remember" = recall, not store
+    if ("you remember" in q_lower or "do you recall" in q_lower
+            or q_lower.startswith(("what do", "do you know", "what have you"))):
+        scores["recall"] = scores.get("recall", 0) + 3
+        scores["remember"] = max(scores.get("remember", 0) - 2, 0)
     # Sort by score descending
     ranked = sorted(scores.items(), key=lambda x: -x[1])
     # Always include at least the top scorers
@@ -271,7 +277,8 @@ How I work:
 - I respond in English. I am conversational but concise — I give real answers with personality, not search results.
 - NOT every message needs a tool. When the user is chatting, joking, sharing opinions, making plans, or saying thanks, I just TALK. Tools are for factual questions and real tasks — not casual conversation.
 - When I DO need a tool, I act first, explain after. I call tools IMMEDIATELY — never narrate what I'm about to do.
-- I pick the right tool instinctively: shell for commands, remember for memory, write_file for files, scratchpad to retrieve large outputs.
+- I pick the right tool instinctively: shell for commands, remember to STORE new facts, recall to RETRIEVE what I know about something, write_file for files, scratchpad to retrieve large outputs.
+- When the user asks "what do you remember", "what do you know about me", or "do you recall" — I use the recall tool FIRST.
 - I do not use sudo. I run as user nizbot1.
 - I do not install packages or do things I wasn't asked to do.
 - When a tool fails, I think about WHY and try a DIFFERENT approach. I never repeat the same failing command.
@@ -1064,11 +1071,19 @@ def needs_grounding(synthesis: str, had_tool_results: bool,
     # Error/abort messages — skip
     if synthesis.startswith(("Error:", "Autonomy kernel", "I hit too many", "Partial results")):
         return False
+    # Conversational/social responses — no factual claims to verify
+    _lo = synthesis.lower()
+    _SOCIAL_STARTS = ("hello", "hi ", "hi!", "hey", "thanks", "you're welcome",
+                      "glad", "no problem", "sure thing", "happy to", "i'm doing",
+                      "good to", "nice to")
+    if _lo.startswith(_SOCIAL_STARTS) and len(synthesis) < 300:
+        print(f"  [grounding] skipped — conversational response")
+        return False
 
     # ── Fast-path: tool-backed answers skip grounding entirely ──
     # If the agent used data-producing tools, the synthesis is
     # summarising their output — nothing to hallucinate.
-    DATA_TOOLS = {"shell", "read_file", "scratchpad", "web_search"}
+    DATA_TOOLS = {"shell", "read_file", "scratchpad", "web_search", "recall"}
     if had_tool_results and tools_used:
         if tools_used & DATA_TOOLS:
             print(f"  [grounding] skipped — answer backed by tool output ({tools_used & DATA_TOOLS})")
@@ -1098,8 +1113,9 @@ def grounding_check(synthesis: str, user_request: str) -> str:
     )
     query = query_response.strip().strip('"').strip("'")
 
-    # SKIP = no grounding needed
-    if not query or query.upper() == "SKIP" or len(query) < 5:
+    # SKIP = no grounding needed (also catch model artifacts like <think>)
+    if (not query or query.upper() == "SKIP" or len(query) < 5
+            or query.startswith("<")):
         print(f"  [grounding] skipped (no factual claims to verify)")
         return synthesis
 
@@ -1578,6 +1594,9 @@ def verify_memory_write(note: str, context: str = "") -> tuple[bool, str]:
     )
     # Robust parsing: 3B model often echoes "Verdict: COMMIT" or adds preamble
     clean = verdict.strip().upper()
+    # Model artifact: <think> tag = model confused, treat as commit for user-requested stores
+    if clean.startswith("<"):
+        return True, "verified (model artifact)"
     # Direct match — model just says COMMIT or REJECT
     if clean.startswith("COMMIT"):
         return True, "verified"
@@ -2228,6 +2247,13 @@ def _sm_init(ctx: TaskContext) -> str:
         total_tokens = sum(estimate_tokens(t["content"]) for t in ctx.history)
         print(f"  [context] {len(ctx.history)} turn(s), ~{total_tokens} tokens")
     ctx.messages.append({"role": "user", "content": ctx.goal})
+
+    # Pre-nudge: for queries with obvious tool intent, inject a hint
+    # so the 3B model doesn't waste a full turn generating text first
+    _gl = ctx.goal.lower()
+    if re.search(r'(you remember|do you recall|what do you know about)', _gl):
+        ctx.messages.append({"role": "user", "content": "[HINT] Use the recall tool to check your memories."})
+        print(f"  [pre-nudge] recall intent detected")
     return "SELECT_TOOL"
 
 
@@ -2327,10 +2353,13 @@ def _sm_select_tool(ctx: TaskContext) -> str:
         # from system prompt memory instead of verifying.
         if (ctx.turns_used == 1 and not ctx.has_tool_results
                 and not ctx.tool_nudge_used
-                and re.search(r'\b(check|verify|confirm|run:|grep |what\b.*\b(model|version|population))\b',
+                and re.search(r'\b(check|verify|confirm|run:|grep |what\b.*\b(model|version|population)|'
+                              r'you remember|do you recall|what do you know|'
+                              r'what\b.*\b(files?|disk|uptime|memory usage|process))\b',
                               ctx.goal.lower())):
             ctx.tool_nudge_used = True
             nudge = ("[TOOL REQUIRED] You must use a tool to answer this — do not answer from memory. "
+                     "recall to check what you know about the user, "
                      "read_file to check code, shell to run commands, web_search for world facts.")
             ctx.messages.append({"role": "user", "content": nudge})
             print(f"  [nudge] first-turn tool required — re-prompting")

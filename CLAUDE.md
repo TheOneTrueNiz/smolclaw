@@ -1,5 +1,9 @@
 # SmolClaw — Claude Code Instructions
 
+## First: Read the Diary
+
+**Before doing anything**, read `diary/instructions.md` then follow its reading order. The diary contains full project context, current status, pending tasks, lessons learned, and collaboration notes from prior sessions. It is the handoff document between Claude Code instances.
+
 ## Cluster Topology
 
 SmolClaw runs on a 3-NUC headless cluster. You are editing code on the **hackbook (nizbot0)**, but the production code runs on **nizbot1 (NUC1)**.

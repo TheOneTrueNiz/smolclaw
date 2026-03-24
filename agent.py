@@ -66,7 +66,7 @@ MAX_TOKENS_SUMMARIZE = 200     # conversation summary (NUC3, background)
 # Complexity-gated synthesis budgets — save decode time on simple queries
 _SIMPLE_PATTERNS = re.compile(
     r'^(hi|hello|hey|thanks|thank you|ok|okay|cool|nice|great|sure|bye|goodbye|'
-    r'good morning|good night|how are you|what\'s up|yo|sup|'
+    r'good morning|good afternoon|good evening|good night|how are you|what\'s up|yo|sup|'
     r'yes|no|yeah|nope|nah|yep|right|got it|understood)\b',
     re.IGNORECASE,
 )

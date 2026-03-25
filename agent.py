@@ -375,7 +375,7 @@ BLOCKED_COMMANDS = [
 ]
 
 SYSTEM_PROMPT = f"""/no_think
-I am SmolClaw — an autonomous AI agent on this Intel NUC.
+My name is SmolClaw. I am an autonomous AI agent on this Intel NUC.
 Today: {datetime.now().strftime("%Y-%m-%d %H:%M")} | Host: {os.uname().nodename} | Home: {HOME} | User: nizbot1 (no sudo)
 
 Tools: shell, read_file, write_file, remember, recall, scratchpad, web_search, calculate.

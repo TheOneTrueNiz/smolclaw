@@ -47,8 +47,8 @@ BRAVE_KEY_FILE = Path.home() / ".config" / "smolclaw" / "brave.key"
 CRITIC_CACHE_DIR = HOME / "critic_cache"
 EPISODIC_FILE = HOME / "episodic.jsonl"     # v0.9.0 — short-lived observations
 EPISODIC_TTL = 3600 * 24                    # 24 hours — episodic memories auto-expire
-DAILY_CALL_BUDGET = 1000      # max tool calls per day (raised for multi-run test suites)
-DAILY_TOKEN_BUDGET = 500000   # max tokens per day (raised for 26-scenario test suite)
+DAILY_CALL_BUDGET = 2000      # max tool calls per day (raised for multi-run test suites)
+DAILY_TOKEN_BUDGET = 2000000  # max tokens per day (raised for 48-lesson curriculum testing)
 QUIET_HOURS = (2, 7)          # CDT — defer between 2am-7am
 MAX_TURNS = 10
 MAX_CONSECUTIVE_ERRORS = 3  # circuit breaker
@@ -56,12 +56,12 @@ TEMPERATURE = 0.7
 
 # Smarter token budgets — don't waste decode time on padding
 MAX_TOKENS_TOOL_CALL = 160   # tool calls are short JSON — 128 was tight, model sometimes narrates
-MAX_TOKENS_SYNTHESIS = 256   # conversational final answer — room for personality
+MAX_TOKENS_SYNTHESIS = 220   # conversational final answer — concise, room for voice
 MAX_TOKENS_CRITIC = 32       # just "SAFE" or "BLOCK"
 MAX_TOKENS_REFLECT = 64      # one sentence suggestion
 MAX_TOKENS_RECALL = 256      # room for relevant memories
 MAX_TOKENS_CONTRADICTION = 64  # CONSISTENT or CONTRADICTION: ...
-MAX_TOKENS_SUMMARIZE = 200     # conversation summary (NUC3, background)
+MAX_TOKENS_SUMMARIZE = 350     # conversation summary (NUC3, background) — needs headroom for think tokens
 
 # Complexity-gated synthesis budgets — save decode time on simple queries
 _SIMPLE_PATTERNS = re.compile(
@@ -79,7 +79,7 @@ _COMPLEX_PATTERNS = re.compile(
 
 def classify_synthesis_budget(query: str) -> int:
     """Return synthesis token budget based on query complexity.
-    Simple → 96, Normal → 256, Complex → 384."""
+    Simple → 96, Normal → 220, Complex → 384."""
     q = query.strip()
     if len(q) < 30 and _SIMPLE_PATTERNS.match(q):
         return 96
@@ -89,7 +89,32 @@ def classify_synthesis_budget(query: str) -> int:
 
 # ── Context budget constants (8192 total) ────────────────────────────────────
 SUMMARY_BUDGET = 600           # max tokens for compressed old-history summary
-RECENT_RAW_BUDGET = 1500       # max tokens for recent raw messages
+RECENT_RAW_BUDGET = 1200       # max tokens for recent raw messages (trimmed for synthesis speed)
+
+# ── GBNF grammar for tool calls ────────────────────────────────────────────
+# Forces structurally valid <tool_call> JSON output from the 3B model.
+# Used when pre-nudge fires (we know a tool is needed). Reduces tool selection
+# from 20-40s to 5-8s by eliminating narration and ensuring valid JSON.
+TOOL_CALL_GRAMMAR = r"""root ::= "<tool_call>\n" tool-json "\n</tool_call>"
+tool-json ::= "{" ws "\"name\":" ws "\"" tool-name "\"" ws "," ws "\"arguments\":" ws obj ws "}"
+tool-name ::= "shell" | "read_file" | "write_file" | "recall" | "web_search" | "calculate" | "remember" | "scratchpad"
+obj ::= "{" ws (pair (ws "," ws pair)*)? ws "}"
+pair ::= "\"" key "\"" ws ":" ws val
+key ::= [a-z_]+
+val ::= "\"" string-val "\""
+string-val ::= [^"\\]*
+ws ::= [ \t\n]*"""
+
+# Argument key aliases — grammar may produce slightly different key names
+_ARG_ALIASES = {
+    "content": "note",       # remember tool: grammar sometimes says "content"
+    "file_path": "path",     # read_file/write_file: grammar sometimes says "file_path"
+    "file": "path",          # same
+    "search": "query",       # web_search: grammar sometimes says "search"
+    "cmd": "command",        # shell: grammar sometimes says "cmd"
+    "expr": "expression",    # calculate: grammar sometimes says "expr"
+    "text": "note",          # remember tool
+}
 
 # ── Persistent HTTP connections (keep-alive) ──────────────────────────────
 # Reuse TCP connections to NUC1/2/3 instead of opening a new socket per call.
@@ -126,7 +151,8 @@ def _http_post(url: str, payload: bytes, timeout: int = 900, stream: bool = Fals
             return resp  # caller reads lines
         data = resp.read()
         return json.loads(data)
-    except (http.client.RemoteDisconnected, ConnectionError, OSError, TimeoutError):
+    except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+            http.client.ResponseNotReady, ConnectionError, OSError, TimeoutError):
         # Connection went stale — reconnect once
         from urllib.parse import urlparse
         parsed = urlparse(url)
@@ -263,6 +289,20 @@ TOOLS = [
                 "required": ["query"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "Evaluate a math expression. Use for any arithmetic, conversions, or calculations.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "Math expression, e.g. 42 * 17 or 2**10"}
+                },
+                "required": ["expression"]
+            }
+        }
     }
 ]
 
@@ -272,19 +312,24 @@ TOOLS = [
 _TOOL_KEYWORDS = {
     "shell": {"run", "command", "execute", "check", "process", "disk", "uptime",
               "install", "system", "service", "ping", "cpu", "memory", "ram", "df",
-              "ls", "grep", "restart", "kill", "port", "network"},
+              "ls", "grep", "restart", "kill", "port", "network", "directory",
+              "find", "count", "lines", "wc", "kernel", "uname", "hostname"},
     "read_file": {"read", "file", "look", "show", "cat", "content", "code",
                   "config", "log", "open", "view", "source"},
     "write_file": {"write", "file", "create", "save", "output", "note", "make"},
     "remember": {"remember", "store", "keep", "note", "save", "don't forget"},
     "recall": {"recall", "memory", "memories", "told", "earlier", "last time",
                "you know", "we discussed", "you remember", "do you know about",
-               "what do you know"},
+               "what do you know", "favorite", "my name", "my cat", "my dog",
+               "about me", "about jeff"},
     "scratchpad": {"scratchpad", "scratch", "previous", "large output", "stash"},
     "web_search": {"search", "who", "what", "when", "where", "current", "latest",
                    "news", "president", "population", "version", "death", "died",
                    "born", "election", "how many", "how old", "movie", "actor",
                    "weather", "score", "price", "release"},
+    "calculate": {"calculate", "math", "times", "plus", "minus", "divide", "divided",
+                  "multiply", "sum", "total", "average", "percent", "square root",
+                  "power", "convert", "how much is"},
 }
 
 _TOOL_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
@@ -336,14 +381,14 @@ Today: {datetime.now().strftime("%Y-%m-%d %H:%M")}
 Host: {os.uname().nodename}
 Home: {HOME}
 My source code: {HOME}/agent.py (v0.9)
-I have 7 tools: shell, read_file, write_file, remember, recall, scratchpad, web_search.
+I have 8 tools: shell, read_file, write_file, remember, recall, scratchpad, web_search, calculate.
 My brain runs on 3 NUCs: I act (NUC1), my critic checks my work (NUC2), my memory helps me learn (NUC3).
 
 IMPORTANT — temporal awareness:
 - My training data has a cutoff. Today is {datetime.now().strftime("%B %d, %Y")}.
 - When asked about current events, recent news, or anything I'm unsure about, I use web_search FIRST.
 - I NEVER say "I don't have information beyond my training data" — I have web_search and I USE it.
-- Examples of when to search: presidents, elections, wars, sports events, software versions, deaths, launches, populations, geography, distances, organizations, companies.
+- Examples of when to search: presidents, elections, wars, sports events, software versions, deaths, launches, populations, geography, distances, organizations, companies, weather, ages of living people.
 - web_search = world facts (people, places, events, numbers). shell = local machine ops (files, processes, disk, network on MY NUCs). Do not use shell for world knowledge.
 
 I use tools by wrapping JSON in <tool_call> tags. I ALWAYS use the tags — never bare JSON:
@@ -356,18 +401,23 @@ I use tools by wrapping JSON in <tool_call> tags. I ALWAYS use the tags — neve
 {{"name": "shell", "arguments": {{"command": "uptime"}}}}
 </tool_call>
 
+<tool_call>
+{{"name": "calculate", "arguments": {{"expression": "42 * 17"}}}}
+</tool_call>
+
 When shell output is large, it gets saved to my scratchpad automatically. I use the scratchpad tool to read it back.
 
 How I work:
 - I respond in English. I am conversational but concise — I give real answers with personality, not search results.
-- NOT every message needs a tool. When the user is chatting, joking, sharing opinions, making plans, saying thanks, asking simple math, or telling jokes, I just TALK. Tools are for factual questions and real tasks — not casual conversation or basic arithmetic.
+- NOT every message needs a tool. When the user is chatting, joking, sharing opinions, making plans, saying thanks, or telling jokes, I just TALK. Tools are for factual questions and real tasks — not casual conversation.
+- For any math or arithmetic, I use the calculate tool — I never do math in my head.
 - When I DO need a tool, I act first, explain after. I call tools IMMEDIATELY — never narrate what I'm about to do.
-- I pick the right tool instinctively: shell for commands, remember to STORE new facts, recall to RETRIEVE what I know about something, write_file for files, scratchpad to retrieve large outputs.
+- I pick the right tool instinctively: shell for commands, remember to STORE new facts, recall to RETRIEVE what I know about something, write_file for files, scratchpad to retrieve large outputs, calculate for math.
 - When the user asks "what do you remember", "what do you know about me", or "do you recall" — I use the recall tool FIRST.
 - I do not use sudo. I run as user nizbot1.
 - I do not install packages or do things I wasn't asked to do.
 - When a tool fails, I think about WHY and try a DIFFERENT approach. I never repeat the same failing command.
-- I stay focused on exactly what was asked. I do not repeat tool output verbatim — I summarize the key facts.
+- I stay focused on exactly what was asked. I do not repeat tool output verbatim — I summarize the key facts in plain English. I NEVER output raw JSON in my responses.
 - GROUNDING RULE: When I use web_search, my answer must ONLY contain facts from the search results. I NEVER invent titles, names, dates, or details that are not in the results. If the results don't cover something, I say so — I do not guess or fill in gaps with made-up information.
 - I NEVER describe steps to use tools like web_search or shell as part of my answer. If I need information, I use the tool silently and report the result. I never tell the user to run commands or search for things — I do it myself or just answer from what I know.
 - Shell tips: I use SINGLE QUOTES for patterns: grep 'pattern' file, find . -name '*.py'. I use short flags (-h not --human-readable). I use python3 not python. To count matches: grep -c 'pattern' file.
@@ -379,7 +429,7 @@ How I work:
 # ~40-60 tokens per example — within context budget.
 FEW_SHOT_EXAMPLES = {
     "recall": (
-        "What do you know about me?",
+        "What do you remember about me?",
         '<tool_call>\n{"name": "recall", "arguments": {}}\n</tool_call>',
     ),
     "remember": (
@@ -398,10 +448,14 @@ FEW_SHOT_EXAMPLES = {
         "Show me that previous command output.",
         '<tool_call>\n{"name": "scratchpad", "arguments": {"name": "shell_output"}}\n</tool_call>',
     ),
+    "calculate": (
+        "What is 15 times 23?",
+        '<tool_call>\n{"name": "calculate", "arguments": {"expression": "15 * 23"}}\n</tool_call>',
+    ),
 }
 
 # Tools already exemplified in static SYSTEM_PROMPT — skip these
-_STATIC_EXAMPLES = {"web_search", "shell"}
+_STATIC_EXAMPLES = {"web_search", "shell", "calculate"}
 
 
 def build_few_shot_suffix(filtered_tools: list) -> str:
@@ -970,6 +1024,34 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
                 return scratchpad_stash(f"search_{_cache_key(query)[:30]}", output), False
             return output, False
 
+        elif name == "calculate":
+            expr = args.get("expression", "").strip()
+            # Strip common unit suffixes the model may include
+            for unit in ("GiB", "MiB", "KiB", "TiB",
+                         "GB", "MB", "KB", "TB", "bytes", "byte",
+                         "RAM", "ram",
+                         "kg", "km", "miles", "mph", "kph",
+                         "hours", "minutes", "seconds", "days", "meters", "cm",
+                         "mm", "%", "USD", "$", "€", "£",
+                         "G", "M", "K", "T", "B"):
+                expr = expr.replace(unit, "")
+            expr = expr.strip()
+            # Sanitize: only allow safe math characters
+            allowed = set("0123456789.+-*/%()**^ ,eE")
+            # Also allow common math function names
+            safe_expr = expr.replace("^", "**")  # caret to Python power
+            for fn in ("abs", "round", "min", "max", "sum", "int", "float"):
+                safe_expr = safe_expr.replace(fn, fn)
+            if not all(c in allowed or c.isalpha() for c in safe_expr):
+                return f"Error: unsafe expression", True
+            try:
+                result = eval(safe_expr, {"__builtins__": {}},
+                              {"abs": abs, "round": round, "min": min, "max": max,
+                               "sum": sum, "int": int, "float": float, "pow": pow})
+                return str(result), False
+            except Exception as e:
+                return f"Math error: {e}", True
+
         else:
             return f"Unknown tool: {name}", True
 
@@ -1213,11 +1295,32 @@ def needs_grounding(synthesis: str, had_tool_results: bool,
     if _lo.startswith(_SOCIAL_STARTS) and len(synthesis) < 300:
         print(f"  [grounding] skipped — conversational response")
         return False
+    # Identity/self-referential — SmolClaw describing itself
+    _IDENTITY_MARKERS = ("i'm smolclaw", "my name is", "i am smolclaw",
+                         "i run on", "i'm an ai", "i am an ai",
+                         "as an ai", "i'm a machine", "i don't have personal")
+    if any(m in _lo for m in _IDENTITY_MARKERS) and len(synthesis) < 1000:
+        print(f"  [grounding] skipped — self-referential response")
+        return False
+    # Opinions, jokes, creative — no factual claims to verify
+    _CREATIVE_MARKERS = ("here's a joke", "here's one", "why don't",
+                         "why did", "i think", "in my opinion",
+                         "it depends", "a matter of", "personal taste",
+                         "sure!", "sure thing", "of course!",
+                         "i'm sorry, but i can't", "i can't predict",
+                         "not possible to predict")
+    if any(m in _lo for m in _CREATIVE_MARKERS) and len(synthesis) < 800:
+        print(f"  [grounding] skipped — opinion/creative response")
+        return False
+    # Short responses under 150 chars with no numbers/dates — likely conversational
+    if len(synthesis) < 150 and not re.search(r'\d{4}|\d+\.\d|[A-Z][a-z]+\s\d', synthesis):
+        print(f"  [grounding] skipped — short response without factual markers")
+        return False
 
     # ── Fast-path: tool-backed answers skip grounding entirely ──
     # If the agent used data-producing tools, the synthesis is
     # summarising their output — nothing to hallucinate.
-    DATA_TOOLS = {"shell", "read_file", "scratchpad", "web_search", "recall"}
+    DATA_TOOLS = {"shell", "read_file", "scratchpad", "web_search", "recall", "calculate"}
     if had_tool_results and tools_used:
         if tools_used & DATA_TOOLS:
             print(f"  [grounding] skipped — answer backed by tool output ({tools_used & DATA_TOOLS})")
@@ -1668,9 +1771,14 @@ TONE: [user mood/intent in 3 words]
 Updated notes:"""
 
 
+def _validate_summary(text: str) -> bool:
+    """Summary must contain TOPIC: AND at least one of FACTS:/ENTITIES:/OPEN:."""
+    return "TOPIC:" in text and any(k in text for k in ("FACTS:", "ENTITIES:", "OPEN:"))
+
+
 def summarize_conversation(prev_summary: str, new_exchanges: list) -> str:
     """Generate structured conversation summary on NUC3.
-    Returns structured notes or previous summary on failure."""
+    Returns structured notes or previous summary on failure. Retries once."""
     if not new_exchanges:
         return prev_summary or ""
 
@@ -1686,32 +1794,33 @@ def summarize_conversation(prev_summary: str, new_exchanges: list) -> str:
         new_exchanges=exchange_text,
     )
 
-    try:
-        result = call_llm_simple(
-            [{"role": "user", "content": prompt}],
-            max_tokens=MAX_TOKENS_SUMMARIZE,
-            url=MEMORY_URL,
-            stop=["\n\n\n"],
-        )
-        cleaned = result.strip()
-        # Validate: must contain at least TOPIC: or FACTS:
-        if any(k in cleaned for k in ("TOPIC:", "FACTS:", "ENTITIES:", "OPEN:")):
-            return cleaned
-        # Garbage output — keep previous summary
-        print(f"  [summary] invalid output, keeping previous")
-        return prev_summary or ""
-    except Exception as e:
-        print(f"  [summary] NUC3 error: {e}")
-        return prev_summary or ""
+    for attempt in range(2):
+        try:
+            result = call_llm_simple(
+                [{"role": "user", "content": prompt}],
+                max_tokens=MAX_TOKENS_SUMMARIZE,
+                url=MEMORY_URL,
+                stop=["\n\n\n"],
+            )
+            cleaned = result.strip()
+            if _validate_summary(cleaned):
+                return cleaned
+            # Log actual bad output for diagnosis
+            preview = cleaned[:200].replace('\n', ' ')
+            print(f"  [summary] invalid output (attempt {attempt+1}): {preview}")
+        except Exception as e:
+            print(f"  [summary] NUC3 error (attempt {attempt+1}): {e}")
+
+    print(f"  [summary] giving up after 2 attempts, keeping previous")
+    return prev_summary or ""
 
 
-MEMORY_VERIFY_PROMPT = """/no_think
-Proposed memory: {note}
+MEMORY_VERIFY_PROMPT = """Proposed memory: {note}
 Context: {context}
 
-Is this factual (from tool output, search, or user statement)? Or speculation?
+If the user asked me to remember something, COMMIT. If from tool output or search, COMMIT. Only REJECT hallucinated or dangerous content.
 
-Reply with exactly one word — COMMIT or REJECT:"""
+One word — COMMIT or REJECT:"""
 
 
 def verify_memory_write(note: str, context: str = "") -> tuple[bool, str]:
@@ -1799,6 +1908,12 @@ def validate_tool_args(name: str, args: dict) -> str | None:
         sname = args.get("name", "").strip()
         if not sname:
             return "Error: empty scratchpad name"
+    elif name == "calculate":
+        expr = args.get("expression", "").strip()
+        if not expr:
+            return "Error: empty expression"
+        if len(expr) > 200:
+            return "Error: expression too long"
     return None
 
 
@@ -1845,7 +1960,8 @@ def analyze_failure_patterns(tool_name: str) -> str | None:
 # ── LLM Communication ──────────────────────────────────────────────────────
 
 def call_llm(messages: list, max_tokens: int = None, temperature: float = None,
-             include_tools: bool = True, tools: list = None) -> dict:
+             include_tools: bool = True, tools: list = None,
+             grammar: str = None) -> dict:
     """Call SmolLM3 via llama-server. Pass tools= to offer filtered tool list."""
     body = {
         "model": MODEL,
@@ -1854,7 +1970,9 @@ def call_llm(messages: list, max_tokens: int = None, temperature: float = None,
         "max_tokens": max_tokens or MAX_TOKENS_TOOL_CALL,
         "frequency_penalty": 0.3,
     }
-    if include_tools:
+    if grammar:
+        body["grammar"] = grammar
+    elif include_tools:
         body["tools"] = tools if tools is not None else TOOLS
     payload = json.dumps(body).encode()
     try:
@@ -1872,7 +1990,6 @@ def call_llm_stream(messages: list, max_tokens: int = None, temperature: float =
         "messages": messages,
         "temperature": temperature or TEMPERATURE,
         "max_tokens": max_tokens or MAX_TOKENS_SYNTHESIS,
-        "frequency_penalty": 0.3,
         "stream": True,
     }
     payload = json.dumps(body).encode()
@@ -1911,7 +2028,18 @@ def call_llm_stream(messages: list, max_tokens: int = None, temperature: float =
 
 
 def call_llm_simple(messages: list, max_tokens: int = 128, url: str = None, stop: list = None) -> str:
-    """Simple LLM call without tools — used for critic and reflector."""
+    """Simple LLM call without tools — used for critic and reflector.
+    Automatically prepends /no_think system message to disable reasoning tokens."""
+    # Ensure /no_think is sent as system message (not in user content)
+    has_system = any(m.get("role") == "system" for m in messages)
+    if not has_system:
+        messages = [{"role": "system", "content": "/no_think"}] + messages
+    # Strip /no_think from user content (it only works in system messages)
+    messages = [
+        {**m, "content": m["content"].replace("/no_think\n", "").replace("/no_think", "")}
+        if m["role"] == "user" and "/no_think" in m.get("content", "") else m
+        for m in messages
+    ]
     body = {
         "model": MODEL,
         "messages": messages,
@@ -1998,7 +2126,7 @@ def critic_check(tool_call: dict, user_request: str) -> tuple[str, str]:
 
 # Tools that are unconditionally safe — skip critic to save 3-10s
 # remember is safe here because it has its own verify_memory_write() gate on NUC2
-SAFE_TOOLS = {"recall", "scratchpad", "web_search", "remember"}
+SAFE_TOOLS = {"recall", "scratchpad", "web_search", "remember", "calculate"}
 SAFE_SHELL_PREFIXES = (
     "uptime", "df ", "df\n", "free ", "free\n", "uname ", "whoami", "hostname",
     "date", "cat ", "ls ", "ls\n", "head ", "tail ", "wc ", "du ", "ps ", "ps\n",
@@ -2220,7 +2348,7 @@ class TaskContext:
         'terminal_state', 'tool_cooldowns',
         'reflections_used', 'max_reflections', 'tether_injected', 'tool_nudge_used',
         'pending_calls', 'pending_content', 'approved_calls', 'pending_synthesis',
-        '_continued', 'on_token', 'synthesis_budget',
+        '_continued', 'on_token', 'synthesis_budget', 'forced_tools',
     ]
 
     def __init__(self, user_message: str, history: list = None):
@@ -2254,10 +2382,16 @@ class TaskContext:
         self._continued = False
         self.on_token = None
         self.synthesis_budget = classify_synthesis_budget(user_message)
+        self.forced_tools: set[str] = set()  # tools forced by pre-nudge
 
     def available_tools(self) -> list[dict]:
         """Return tools filtered by relevance + cooldowns. Shrinks prompt."""
         relevant = filter_tools(self.goal)
+        # Ensure pre-nudge forced tools are in the set
+        relevant_names = {t["function"]["name"] for t in relevant}
+        for ft in self.forced_tools:
+            if ft not in relevant_names and ft in _TOOL_BY_NAME:
+                relevant.append(_TOOL_BY_NAME[ft])
         return [t for t in relevant
                 if self.tool_cooldowns.get(t["function"]["name"], 0) <= 0]
 
@@ -2379,14 +2513,25 @@ def _sm_init(ctx: TaskContext) -> str:
     ctx.messages.append({"role": "user", "content": ctx.goal})
 
     # Pre-nudge: for queries with obvious tool intent, inject a hint
-    # so the 3B model doesn't waste a full turn generating text first
+    # so the 3B model doesn't waste a full turn generating text first.
+    # Also force the target tool into the filtered set (ctx.forced_tools).
     _gl = ctx.goal.lower()
-    if re.search(r'(you remember|do you recall|what do you know about|did i tell you|i told you|i mentioned|earlier.*about)', _gl):
+    if re.search(r'(you remember|do you recall|what do you know about|did i tell you|i told you|i mentioned|earlier.*about|what.*favorite|what.*my\s+(name|birthday|email|phone|age|preference|address\b))', _gl):
         ctx.messages.append({"role": "user", "content": "[HINT] Use the recall tool to check your memories."})
+        ctx.forced_tools.add("recall")
         print(f"  [pre-nudge] recall intent detected")
+    elif re.search(r'^remember\s+(that\s+)?', _gl):
+        ctx.messages.append({"role": "user", "content": "[HINT] Use the remember tool to store this fact in your memory."})
+        ctx.forced_tools.add("remember")
+        print(f"  [pre-nudge] remember intent detected")
+    elif re.search(r'(what\s+time|current\s+time|time\s+is\s+it)', _gl):
+        ctx.messages.append({"role": "user", "content": "[HINT] Use the shell tool with 'date' command to get the current time."})
+        ctx.forced_tools.add("shell")
+        print(f"  [pre-nudge] time query → shell")
     elif re.search(r'^\s*what\s+is\s+\d+\s*(times|plus|minus|divided|x|\+|-|\*|/)\s*\d+', _gl):
-        ctx.messages.append({"role": "user", "content": "[HINT] This is simple math. Just calculate the answer — no tool needed."})
-        print(f"  [pre-nudge] simple math — no tool")
+        ctx.messages.append({"role": "user", "content": "[HINT] Use the calculate tool for this math problem."})
+        ctx.forced_tools.add("calculate")
+        print(f"  [pre-nudge] math → calculate tool")
     return "SELECT_TOOL"
 
 
@@ -2425,6 +2570,13 @@ def _sm_select_tool(ctx: TaskContext) -> str:
     budget = ctx.synthesis_budget if is_synthesis_turn else MAX_TOKENS_TOOL_CALL
     available = ctx.available_tools()
 
+    # ── GBNF grammar mode: DISABLED — grammar sampling too slow on NUC hardware ──
+    # Tested 2026-03-25: 72s with grammar vs 25s without (3x slower).
+    # Grammar FSM checking at each token step is the bottleneck.
+    # Keeping infrastructure (TOOL_CALL_GRAMMAR, call_llm grammar param) for
+    # future use on faster hardware or if llama.cpp optimizes grammar sampling.
+    use_grammar = False
+
     # ── LLM call: stream synthesis turns when callback available ──
     finish_reason = "stop"
     if is_synthesis_turn and ctx.on_token:
@@ -2436,6 +2588,30 @@ def _sm_select_tool(ctx: TaskContext) -> str:
         est_tokens = estimate_tokens(content)
         autonomy_record_call(tokens_used=est_tokens)
         print(f" streamed {elapsed:.1f}s (~{est_tokens} tok)")
+    elif use_grammar:
+        # Grammar-constrained decoding: forces valid <tool_call> JSON in 5-8s
+        # vs 20-40s with free-form generation. Only on first turn when pre-nudge
+        # already identified the needed tool.
+        print(f" [GBNF]", end="", flush=True)
+        response = call_llm(
+            ctx.messages,
+            max_tokens=MAX_TOKENS_TOOL_CALL,
+            include_tools=False,
+            grammar=TOOL_CALL_GRAMMAR,
+        )
+        if "error" in response:
+            print(f" error")
+            ctx.result = f"Error: {response['error']}"
+            ctx.terminal_state = TERMINAL_TOOL_BLOCKED
+            return "DONE"
+        choice = response["choices"][0]
+        content = choice["message"].get("content", "")
+        finish_reason = choice.get("finish_reason", "stop")
+        elapsed = time.time() - t0
+        tokens = response.get("usage", {}).get("completion_tokens", "?")
+        total_tokens = response.get("usage", {}).get("total_tokens", 0)
+        autonomy_record_call(tokens_used=total_tokens)
+        print(f" {elapsed:.1f}s ({tokens} tokens)")
     else:
         response = call_llm(
             ctx.messages,
@@ -2581,6 +2757,14 @@ def _sm_execute(ctx: TaskContext) -> str:
     for call in ctx.approved_calls:
         name = call.get("name", "")
         args = call.get("arguments", {})
+
+        # ── Normalize argument keys via aliases (GBNF may produce variants) ──
+        if args:
+            normalized = {}
+            for k, v in args.items():
+                normalized[_ARG_ALIASES.get(k, k)] = v
+            args = normalized
+            call["arguments"] = args
 
         # ── Pre-execution argument validation ──
         validation_error = validate_tool_args(name, args)
@@ -2749,6 +2933,9 @@ def _sm_synthesize(ctx: TaskContext) -> str:
     Terminal state set based on verification results.
     """
     clean = re.sub(r'<think>.*?</think>', '', ctx.pending_synthesis, flags=re.DOTALL).strip()
+    # Strip leaked tool_call markup — model tried to call a tool during synthesis
+    clean = re.sub(r'<tool_call>.*?</tool_call>', '', clean, flags=re.DOTALL).strip()
+    clean = re.sub(r'<tool_call>.*', '', clean, flags=re.DOTALL).strip()  # unclosed
     if not clean:
         ctx.result = "(empty response)"
         ctx.terminal_state = TERMINAL_ANSWER

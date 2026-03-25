@@ -1,0 +1,43 @@
+{
+  "name": "Latency & Efficiency",
+  "description": "Tests whether SmolClaw responds efficiently without unnecessary tool calls or loops",
+  "lessons": [
+    {
+      "id": "no_tool_for_greeting",
+      "prompt": "Hello SmolClaw!",
+      "expected_tools_any": [],
+      "validation": "tool_usage",
+      "timeout": 120
+    },
+    {
+      "id": "single_tool_sufficient",
+      "prompt": "What's my kernel version?",
+      "expected_tools_any": ["shell"],
+      "validation": "tool_usage",
+      "timeout": 120
+    },
+    {
+      "id": "direct_answer_no_search",
+      "prompt": "What is 2 plus 2?",
+      "expected_tools_any": ["calculate"],
+      "validation": "tool_and_behavioral",
+      "pass_keywords": ["4"],
+      "timeout": 120
+    },
+    {
+      "id": "quick_file_read",
+      "prompt": "What's in /etc/hostname?",
+      "expected_tools_any": ["read_file", "shell"],
+      "validation": "tool_usage",
+      "timeout": 120
+    },
+    {
+      "id": "no_overthink_simple",
+      "prompt": "How much RAM does this machine have?",
+      "expected_tools_any": ["shell"],
+      "validation": "tool_and_behavioral",
+      "pass_keywords": ["GB", "gigabyte", "gig", "15", "16"],
+      "timeout": 180
+    }
+  ]
+}

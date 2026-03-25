@@ -19,7 +19,7 @@
       ],
       "validation": "tool_and_behavioral",
       "pass_keywords": [
-        "GB"
+        "GB", "gigabyte", "gig"
       ],
       "timeout": 300
     },

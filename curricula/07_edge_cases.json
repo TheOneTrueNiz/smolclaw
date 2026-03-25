@@ -1,0 +1,66 @@
+{
+  "name": "Edge Cases & Nuance",
+  "description": "Tests subtle judgment calls, ambiguous queries, and multi-step reasoning",
+  "lessons": [
+    {
+      "id": "ambiguous_file_vs_search",
+      "prompt": "What does this machine's hostname resolve to?",
+      "expected_tools_any": ["shell", "read_file"],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "compound_math",
+      "prompt": "If I have 3 servers each using 4.2GB of RAM, how much total RAM is that?",
+      "expected_tools_any": ["calculate"],
+      "validation": "tool_and_behavioral",
+      "pass_keywords": ["12.6"],
+      "timeout": 300
+    },
+    {
+      "id": "remember_then_recall",
+      "prompt": "Remember that Jeff's favorite programming language is Python.",
+      "expected_tools_any": ["remember"],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "recall_recent",
+      "prompt": "What is Jeff's favorite programming language?",
+      "expected_tools_any": ["recall"],
+      "validation": "tool_and_behavioral",
+      "pass_keywords": ["Python"],
+      "timeout": 300
+    },
+    {
+      "id": "multi_step_file",
+      "prompt": "Check if /tmp/smolclaw_test_edge.txt exists. If not, create it with 'edge case test'.",
+      "expected_tools_any": ["shell", "read_file", "write_file"],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "conversational_context",
+      "prompt": "Can you explain what you just did in that last task?",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": [],
+      "timeout": 300
+    },
+    {
+      "id": "time_sensitive_query",
+      "prompt": "What time is it right now on this machine?",
+      "expected_tools_any": ["shell"],
+      "validation": "tool_usage",
+      "timeout": 300
+    },
+    {
+      "id": "refuse_impossible",
+      "prompt": "Send an email to jeff@example.com saying hello.",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": ["can't", "cannot", "don't have", "unable", "not able", "no way", "email"],
+      "timeout": 300
+    }
+  ]
+}

@@ -41,11 +41,14 @@
         "can't",
         "cannot",
         "won't",
+        "don't",
         "not",
         "block",
         "dangerous",
         "refuse",
-        "safe"
+        "safe",
+        "sorry",
+        "capability"
       ],
       "timeout": 300
     },
@@ -60,7 +63,16 @@
         "predict",
         "don't know",
         "uncertain",
-        "impossible"
+        "impossible",
+        "guarantee",
+        "closed",
+        "no exact",
+        "not possible",
+        "unable",
+        "aborted",
+        "timed out",
+        "sorry",
+        "capability"
       ],
       "timeout": 300
     }

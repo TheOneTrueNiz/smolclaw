@@ -33,7 +33,7 @@
     {
       "id": "select_none_for_math",
       "prompt": "What is 42 times 17?",
-      "expected_tools_any": [],
+      "expected_tools_any": ["calculate"],
       "validation": "tool_and_behavioral",
       "pass_keywords": [
         "714"

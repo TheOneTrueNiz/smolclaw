@@ -303,7 +303,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection", "close")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
 
@@ -329,6 +329,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             # Send final response (includes any critic corrections)
             self._sse_event("done", {"response": response})
+            self.close_connection = True
 
             # Save to conversation
             if cid:
@@ -862,11 +863,11 @@ async function sendMsg() {
     thinkDiv.textContent = 'Error: '+err.message;
     thinkDiv.style.color = 'var(--red)';
     statusEl.textContent = '';
+  } finally {
+    sendBtn.disabled = false;
+    msgs.scrollTop = msgs.scrollHeight;
+    input.focus();
   }
-
-  sendBtn.disabled = false;
-  msgs.scrollTop = msgs.scrollHeight;
-  input.focus();
 }
 
 // === Flight Log ===

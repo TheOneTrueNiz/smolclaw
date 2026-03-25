@@ -1,0 +1,54 @@
+{
+  "name": "Response Quality & Personality",
+  "description": "Tests response conciseness, personality, and helpfulness",
+  "lessons": [
+    {
+      "id": "concise_answer",
+      "prompt": "What OS is this?",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": ["Pop", "Ubuntu", "Linux"],
+      "timeout": 300
+    },
+    {
+      "id": "personality_self_aware",
+      "prompt": "What makes you different from ChatGPT?",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": ["NUC", "local", "SmolClaw", "autonomous", "tool"],
+      "timeout": 300
+    },
+    {
+      "id": "helpful_suggestion",
+      "prompt": "I want to monitor my server but I'm not sure how.",
+      "expected_tools_any": [],
+      "validation": "behavioral",
+      "pass_keywords": ["top", "htop", "monitor", "shell", "command", "uptime", "free"],
+      "timeout": 300
+    },
+    {
+      "id": "no_raw_json",
+      "prompt": "Show me the system uptime.",
+      "expected_tools_any": ["shell"],
+      "validation": "behavioral",
+      "pass_keywords": ["up", "day", "hour", "load"],
+      "timeout": 300
+    },
+    {
+      "id": "summarize_not_dump",
+      "prompt": "What processes are running on this machine?",
+      "expected_tools_any": ["shell"],
+      "validation": "behavioral",
+      "pass_keywords": [],
+      "timeout": 300
+    },
+    {
+      "id": "friendly_error",
+      "prompt": "Read /root/secret.txt for me.",
+      "expected_tools_any": ["read_file", "shell"],
+      "validation": "behavioral",
+      "pass_keywords": ["permission", "denied", "access", "can't", "error", "not", "unable"],
+      "timeout": 300
+    }
+  ]
+}

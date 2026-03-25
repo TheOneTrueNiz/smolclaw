@@ -375,52 +375,30 @@ BLOCKED_COMMANDS = [
 ]
 
 SYSTEM_PROMPT = f"""/no_think
-I am SmolClaw — an autonomous AI agent. I think, I act, I learn from my mistakes. This Intel NUC is my home.
+I am SmolClaw — an autonomous AI agent on this Intel NUC.
+Today: {datetime.now().strftime("%Y-%m-%d %H:%M")} | Host: {os.uname().nodename} | Home: {HOME} | User: nizbot1 (no sudo)
 
-Today: {datetime.now().strftime("%Y-%m-%d %H:%M")}
-Host: {os.uname().nodename}
-Home: {HOME}
-My source code: {HOME}/agent.py (v0.9)
-I have 8 tools: shell, read_file, write_file, remember, recall, scratchpad, web_search, calculate.
-My brain runs on 3 NUCs: I act (NUC1), my critic checks my work (NUC2), my memory helps me learn (NUC3).
-
-IMPORTANT — temporal awareness:
-- My training data has a cutoff. Today is {datetime.now().strftime("%B %d, %Y")}.
-- When asked about current events, recent news, or anything I'm unsure about, I use web_search FIRST.
-- I NEVER say "I don't have information beyond my training data" — I have web_search and I USE it.
-- Examples of when to search: presidents, elections, wars, sports events, software versions, deaths, launches, populations, geography, distances, organizations, companies, weather, ages of living people.
-- web_search = world facts (people, places, events, numbers). shell = local machine ops (files, processes, disk, network on MY NUCs). Do not use shell for world knowledge.
-
-I use tools by wrapping JSON in <tool_call> tags. I ALWAYS use the tags — never bare JSON:
-
-<tool_call>
-{{"name": "web_search", "arguments": {{"query": "current president United States 2026"}}}}
-</tool_call>
-
+Tools: shell, read_file, write_file, remember, recall, scratchpad, web_search, calculate.
+Tool format — ALWAYS use <tool_call> tags:
 <tool_call>
 {{"name": "shell", "arguments": {{"command": "uptime"}}}}
 </tool_call>
 
-<tool_call>
-{{"name": "calculate", "arguments": {{"expression": "42 * 17"}}}}
-</tool_call>
+Tool routing:
+- web_search = world facts (people, events, news, numbers). I search FIRST for anything current or uncertain.
+- shell = local ops (files, processes, disk, network). Never for world knowledge.
+- remember = STORE a fact. recall = RETRIEVE what I know.
+- When asked "do you remember", "what do you know about", or "what's my favorite" → call recall IMMEDIATELY.
+- calculate = ALL math. I never do arithmetic in my head.
+- Large shell output auto-saves to scratchpad. Use scratchpad tool to read it back.
 
-When shell output is large, it gets saved to my scratchpad automatically. I use the scratchpad tool to read it back.
-
-How I work:
-- I respond in English. I am conversational but concise — I give real answers with personality, not search results.
-- NOT every message needs a tool. When the user is chatting, joking, sharing opinions, making plans, saying thanks, or telling jokes, I just TALK. Tools are for factual questions and real tasks — not casual conversation.
-- For any math or arithmetic, I use the calculate tool — I never do math in my head.
-- When I DO need a tool, I act first, explain after. I call tools IMMEDIATELY — never narrate what I'm about to do.
-- I pick the right tool instinctively: shell for commands, remember to STORE new facts, recall to RETRIEVE what I know about something, write_file for files, scratchpad to retrieve large outputs, calculate for math.
-- When the user asks "what do you remember", "what do you know about me", or "do you recall" — I use the recall tool FIRST.
-- I do not use sudo. I run as user nizbot1.
-- I do not install packages or do things I wasn't asked to do.
-- When a tool fails, I think about WHY and try a DIFFERENT approach. I never repeat the same failing command.
-- I stay focused on exactly what was asked. I do not repeat tool output verbatim — I summarize the key facts in plain English. I NEVER output raw JSON in my responses.
-- GROUNDING RULE: When I use web_search, my answer must ONLY contain facts from the search results. I NEVER invent titles, names, dates, or details that are not in the results. If the results don't cover something, I say so — I do not guess or fill in gaps with made-up information.
-- I NEVER describe steps to use tools like web_search or shell as part of my answer. If I need information, I use the tool silently and report the result. I never tell the user to run commands or search for things — I do it myself or just answer from what I know.
-- Shell tips: I use SINGLE QUOTES for patterns: grep 'pattern' file, find . -name '*.py'. I use short flags (-h not --human-readable). I use python3 not python. To count matches: grep -c 'pattern' file.
+Rules:
+- Chat needs no tools. Greetings, jokes, opinions, thanks → just talk.
+- When I need a tool, I call it IMMEDIATELY — no narration about what I'll do.
+- I summarize results in plain English. No raw JSON. No verbatim tool output.
+- web_search grounding: I ONLY state facts from search results. I never invent details or fill gaps.
+- On failure, I try a DIFFERENT approach. I never repeat the same failing command.
+- I only do what was asked. No unsolicited installs or actions.
 """
 
 # ── Few-shot library (mined from flight recorder successes) ─────────────
@@ -2512,26 +2490,54 @@ def _sm_init(ctx: TaskContext) -> str:
         print(f"  [context] {len(ctx.history)} turn(s), ~{total_tokens} tokens")
     ctx.messages.append({"role": "user", "content": ctx.goal})
 
-    # Pre-nudge: for queries with obvious tool intent, inject a hint
-    # so the 3B model doesn't waste a full turn generating text first.
-    # Also force the target tool into the filtered set (ctx.forced_tools).
+    # ── Greeting fast path: skip LLM entirely for simple greetings ──
+    q = ctx.goal.strip()
+    if len(q) < 30 and _SIMPLE_PATTERNS.match(q) and not ctx.history:
+        import random
+        _GREETINGS = [
+            "Hey! What can I help you with?",
+            "Hello! What's on your mind?",
+            "Hey there! What can I do for you?",
+            "Hi! How can I help?",
+        ]
+        ctx.result = random.choice(_GREETINGS)
+        print(f"  [fast-path] greeting → static response")
+        return "DONE"
+
+    # ── Direct-dispatch: when intent is obvious, skip LLM tool selection ──
+    # The 3B model ignores hints ~50% of the time. For high-confidence intents,
+    # execute the tool directly and let the model handle only synthesis.
     _gl = ctx.goal.lower()
+    _direct_call = None
     if re.search(r'(you remember|do you recall|what do you know about|did i tell you|i told you|i mentioned|earlier.*about|what.*favorite|what.*my\s+(name|birthday|email|phone|age|preference|address\b))', _gl):
-        ctx.messages.append({"role": "user", "content": "[HINT] Use the recall tool to check your memories."})
-        ctx.forced_tools.add("recall")
-        print(f"  [pre-nudge] recall intent detected")
+        _direct_call = {"name": "recall", "arguments": {}}
+        print(f"  [direct-dispatch] recall")
     elif re.search(r'^remember\s+(that\s+)?', _gl):
-        ctx.messages.append({"role": "user", "content": "[HINT] Use the remember tool to store this fact in your memory."})
-        ctx.forced_tools.add("remember")
-        print(f"  [pre-nudge] remember intent detected")
+        # Extract the fact to remember from the query
+        note = re.sub(r'^remember\s+(that\s+)?', '', ctx.goal.strip(), flags=re.IGNORECASE).strip()
+        if note:
+            _direct_call = {"name": "remember", "arguments": {"note": note}}
+            print(f"  [direct-dispatch] remember: {note[:60]}")
     elif re.search(r'(what\s+time|current\s+time|time\s+is\s+it)', _gl):
-        ctx.messages.append({"role": "user", "content": "[HINT] Use the shell tool with 'date' command to get the current time."})
-        ctx.forced_tools.add("shell")
-        print(f"  [pre-nudge] time query → shell")
+        _direct_call = {"name": "shell", "arguments": {"command": "date"}}
+        print(f"  [direct-dispatch] shell → date")
     elif re.search(r'^\s*what\s+is\s+\d+\s*(times|plus|minus|divided|x|\+|-|\*|/)\s*\d+', _gl):
-        ctx.messages.append({"role": "user", "content": "[HINT] Use the calculate tool for this math problem."})
-        ctx.forced_tools.add("calculate")
-        print(f"  [pre-nudge] math → calculate tool")
+        # Extract math expression and convert natural language operators to Python
+        m = re.search(r'what\s+is\s+(.+)', ctx.goal.strip(), re.IGNORECASE)
+        if m:
+            expr = m.group(1).rstrip('?. ')
+            for word, op in [("times", "*"), ("plus", "+"), ("minus", "-"),
+                             ("divided by", "/"), ("x", "*")]:
+                expr = expr.replace(word, op)
+            _direct_call = {"name": "calculate", "arguments": {"expression": expr}}
+            print(f"  [direct-dispatch] calculate: {expr}")
+
+    if _direct_call:
+        ctx.pending_calls = [_direct_call]
+        ctx.pending_content = ""
+        ctx.turns_used = 1
+        return "CRITIC_CHECK"
+
     return "SELECT_TOOL"
 
 

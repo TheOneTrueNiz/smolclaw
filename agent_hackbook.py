@@ -2508,23 +2508,37 @@ def _sm_init(ctx: TaskContext) -> str:
     # ── Direct-dispatch: when intent is obvious, skip LLM tool selection ──
     # The 3B model ignores hints ~50% of the time. For high-confidence intents,
     # execute the tool directly and let the model handle only synthesis.
+    # Each pattern saves 20-40s by skipping the LLM tool-selection call.
     _gl = ctx.goal.lower()
     _direct_call = None
+
+    # Guard: compound queries ("X, then Y", "X and Y" with multiple intents) need LLM
+    _is_compound = bool(re.search(r'\bthen\s+(remember|search|read|write|check)\b', _gl)) or (
+        sum(1 for p in [r'\bdisk\b|storage|\bspace\b', r'\bmemory\b|\bram\b',
+                         r'\buptime\b', r'\bprocess\b|\bcpu\b']
+            if re.search(p, _gl)) >= 2
+    )
+
+    # -- Memory: recall --
     if re.search(r'(you remember|do you recall|what do you know about|did i tell you|i told you|i mentioned|earlier.*about|what.*favorite|what.*my\s+(name|birthday|email|phone|age|preference|address\b))', _gl):
         _direct_call = {"name": "recall", "arguments": {}}
         print(f"  [direct-dispatch] recall")
+
+    # -- Memory: remember --
     elif re.search(r'^remember\s+(that\s+)?', _gl):
-        # Extract the fact to remember from the query
         note = re.sub(r'^remember\s+(that\s+)?', '', ctx.goal.strip(), flags=re.IGNORECASE).strip()
         if note:
             _direct_call = {"name": "remember", "arguments": {"note": note}}
             print(f"  [direct-dispatch] remember: {note[:60]}")
+
+    # -- Time --
     elif re.search(r'(what\s+time|current\s+time|time\s+is\s+it)', _gl):
         _direct_call = {"name": "shell", "arguments": {"command": "date"}}
         print(f"  [direct-dispatch] shell → date")
-    elif re.search(r'^\s*what\s+is\s+\d+\s*(times|plus|minus|divided|x|\+|-|\*|/)\s*\d+', _gl):
-        # Extract math expression and convert natural language operators to Python
-        m = re.search(r'what\s+is\s+(.+)', ctx.goal.strip(), re.IGNORECASE)
+
+    # -- Math (expanded: "what is/what's X op Y", "calculate X") --
+    elif re.search(r'^\s*(what\s+is|what\'?s)\s+\d[\d.]*\s*(times|plus|minus|divided|x|\+|-|\*|/)\s*\d', _gl):
+        m = re.search(r'(?:what\s+is|what\'?s)\s+(.+)', ctx.goal.strip(), re.IGNORECASE)
         if m:
             expr = m.group(1).rstrip('?. ')
             for word, op in [("times", "*"), ("plus", "+"), ("minus", "-"),
@@ -2532,6 +2546,69 @@ def _sm_init(ctx: TaskContext) -> str:
                 expr = expr.replace(word, op)
             _direct_call = {"name": "calculate", "arguments": {"expression": expr}}
             print(f"  [direct-dispatch] calculate: {expr}")
+    elif re.search(r'^calculate\s+', _gl):
+        expr = re.sub(r'^calculate\s+', '', ctx.goal.strip(), flags=re.IGNORECASE).rstrip('?. ')
+        if expr:
+            for word, op in [("times", "*"), ("plus", "+"), ("minus", "-"),
+                             ("divided by", "/"), ("x", "*")]:
+                expr = expr.replace(word, op)
+            _direct_call = {"name": "calculate", "arguments": {"expression": expr}}
+            print(f"  [direct-dispatch] calculate: {expr}")
+
+    # -- Web search (explicit: "search for X", "look up X") --
+    elif not _is_compound and re.search(r'^(search\s+(for|the\s+web\s+for)|look\s+up|google)\s+', _gl):
+        query = re.sub(r'^(search\s+(for|the\s+web\s+for)|look\s+up|google)\s+', '', ctx.goal.strip(), flags=re.IGNORECASE).strip().rstrip('?.')
+        if query and not query.startswith('/'):
+            _direct_call = {"name": "web_search", "arguments": {"query": query}}
+            print(f"  [direct-dispatch] web_search: {query[:60]}")
+
+    # -- Web search (question: "who won/is/was X") --
+    elif re.search(r'^who\s+(is|was|are|were|won|invented|discovered|created|founded)\b', _gl):
+        query = ctx.goal.strip().rstrip('?.')
+        _direct_call = {"name": "web_search", "arguments": {"query": query}}
+        print(f"  [direct-dispatch] web_search: {query[:60]}")
+
+    # -- Shell: disk space --
+    elif not _is_compound and re.search(r'(disk\s*space|how\s+much\s+(free\s+)?(space|storage)|storage\s+(left|free|available|remaining))', _gl):
+        _direct_call = {"name": "shell", "arguments": {"command": "df -h /"}}
+        print(f"  [direct-dispatch] shell → df -h /")
+
+    # -- Shell: RAM/memory --
+    elif not _is_compound and re.search(r'(how\s+much\s+(ram|memory)|free\s+memory|memory\s+(usage|used|available|free)\b|ram\s+(usage|available|free)\b)', _gl):
+        _direct_call = {"name": "shell", "arguments": {"command": "free -h"}}
+        print(f"  [direct-dispatch] shell → free -h")
+
+    # -- Shell: uptime --
+    elif not _is_compound and re.search(r'\b(system\s+)?uptime\b|how\s+long\s+(has|have).+been\s+(running|up|on)\b', _gl):
+        _direct_call = {"name": "shell", "arguments": {"command": "uptime"}}
+        print(f"  [direct-dispatch] shell → uptime")
+
+    # -- Shell: kernel version --
+    elif re.search(r'kernel\s*(version|info)\b', _gl):
+        _direct_call = {"name": "shell", "arguments": {"command": "uname -a"}}
+        print(f"  [direct-dispatch] shell → uname -a")
+
+    # -- Shell: processes/CPU --
+    elif not _is_compound and re.search(r'(what\s+processes|processes\s+(are\s+)?(running|using)|top\s+processes|cpu\s+(usage|right\s+now)|using.*most\s+cpu|most\s+cpu)', _gl):
+        if re.search(r'(most\s+cpu|cpu\s+(usage|right)|using.*cpu)', _gl):
+            cmd = "ps aux --sort=-%cpu | head -10"
+        else:
+            cmd = "ps aux | head -20"
+        _direct_call = {"name": "shell", "arguments": {"command": cmd}}
+        print(f"  [direct-dispatch] shell → {cmd.split('|')[0].strip()}")
+
+    # -- Shell: hostname --
+    elif re.search(r"what('?s|\s+is)\s+(the\s+|this\s+(machine'?s?\s+)?)?hostname", _gl):
+        _direct_call = {"name": "shell", "arguments": {"command": "hostname"}}
+        print(f"  [direct-dispatch] shell → hostname")
+
+    # -- Read file (explicit path: "read /etc/X", "what's in /etc/X") --
+    elif re.search(r'(read\s+(the\s+file\s+)?|show\s+me\s+(the\s+)?(contents?\s+of\s+)?|contents?\s+of\s+|what\'?s\s+in\s+)(/\S+)', _gl):
+        m = re.search(r'(/\S+)', ctx.goal.strip())
+        if m:
+            path = m.group(1).rstrip('?.,;:!')
+            _direct_call = {"name": "read_file", "arguments": {"path": path}}
+            print(f"  [direct-dispatch] read_file: {path}")
 
     if _direct_call:
         ctx.pending_calls = [_direct_call]

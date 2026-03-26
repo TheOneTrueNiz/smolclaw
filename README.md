@@ -4,11 +4,11 @@
 
 **An autonomous AI agent running on $75 of yard sale hardware.**
 
-SmolClaw is a custom-built agentic harness that proves real AI autonomy doesn't require cloud GPUs, paid APIs, or expensive hardware. It runs entirely on three Intel NUCs bought at yard sales, using an open-weight 3B parameter model, and achieves a 46/48 (95.8%) pass rate on its expanded multi-tier curriculum.
+SmolClaw is a custom-built agentic harness that proves real AI autonomy doesn't require cloud GPUs, paid APIs, or expensive hardware. It runs entirely on three Intel NUCs bought at yard sales, using an open-weight 3B parameter model, and achieves a 45/48 (93.8%) pass rate on its expanded multi-tier curriculum.
 
 ```
     ╔═══════════════════════════════════════════╗
-    ║  🦀 SmolClaw v0.9.1                      ║
+    ║  🦀 SmolClaw v0.9.2                      ║
     ║  SmolLM3-3B · State Machine Cluster     ║
     ║  $75 yard sale hardware · AI for all    ║
     ╚═══════════════════════════════════════════╝
@@ -87,7 +87,7 @@ Served via **llama.cpp** (`llama-server`) with `--jinja` for native SmolLM3 chat
 │                                                           │
 │  Fast paths (skip LLM entirely):                          │
 │    Greeting regex → instant static response               │
-│    Direct-dispatch → recall/time/math/remember            │
+│    Direct-dispatch → 15 patterns (search, disk, files...) │
 │                                                           │
 │  Terminal states:                                         │
 │    ANSWER · INSUFFICIENT_EVIDENCE                         │
@@ -131,7 +131,7 @@ Served via **llama.cpp** (`llama-server`) with `--jinja` for native SmolLM3 chat
 
 **State Machine Dispatcher** (v0.9.0) — Deterministic state machine replaces the v0.6 while-loop. States: INIT → SELECT_TOOL ↔ (CRITIC_CHECK → EXECUTE) → SYNTHESIZE → DONE. Terminal states provide structured exit conditions.
 
-**Direct-Dispatch** (v0.9.1) — For high-confidence intents (recall, remember, time, math), regex detection skips LLM tool selection entirely and executes the tool directly. The LLM only handles synthesis. Eliminates 20-40s of unreliable 3B model deliberation.
+**Direct-Dispatch** (v0.9.2) — 15 regex patterns covering recall, remember, time, math, web search, disk, RAM, uptime, kernel, processes, hostname, and file reads. For high-confidence intents, regex detection skips LLM tool selection entirely and executes the tool directly. The LLM only handles synthesis. Compound query guard prevents false matches on multi-intent queries. Eliminates 20-40s of unreliable 3B model deliberation per dispatched query.
 
 **Greeting Fast Path** (v0.9.1) — Simple greetings return instant static responses without any LLM call (0.0s vs 40s+).
 
@@ -209,19 +209,33 @@ Measured on the 3-NUC cluster with SmolLM3-3B Q4_K_M, `--threads 4`, `--flash-at
 
 ### End-to-End Response Times (at Web UI)
 
-| Category | v0.9.0 (before) | v0.9.1 (after) | Improvement |
-|----------|-----------------|-----------------|-------------|
-| **Simple avg** | 60-130s | **9.1s** | 7-14x |
-| Simple min | ~3s | **0.0s** (instant) | --- |
-| Simple max | ~130s | 30.4s | 4x |
-| **Complex avg** | 80-150s | **50.8s** | 2-3x |
-| Complex min | ~50s | 33.1s | 1.5x |
-| Complex max | ~180s+ | 64.5s | 3x |
-| **Overall avg** | ~90-120s | **30.0s** | **3-4x** |
+| Category | v0.9.0 | v0.9.1 | v0.9.2 | Improvement |
+|----------|--------|--------|--------|-------------|
+| **Simple avg** | 60-130s | 9.1s | **8.5s** | 7-15x |
+| Simple min | ~3s | 0.0s | **0.0s** (instant) | --- |
+| Simple max | ~130s | 30.4s | **17s** | 8x |
+| **Complex avg** | 80-150s | 50.8s | **45s** | 2-3x |
+| Complex min | ~50s | 33.1s | **27s** | 2x |
+| Complex max | ~180s+ | 64.5s | **60s** | 3x |
+| **Overall avg** | ~90-120s | 30.0s | **26.7s** | **3.5-4.5x** |
+
+#### Dispatch-Targeted Speedups (v0.9.1 → v0.9.2)
+
+| Query Type | Before | After | Speedup |
+|------------|--------|-------|---------|
+| Greeting | 0.0s | 0.0s | instant |
+| Math (2+2) | 4.0s | 4.3s | stable |
+| Time query | 6.4s | 7.8s | stable |
+| Disk space | 27.3s | 9.7s | **2.8x** |
+| File read | 57.5s | 10.6s | **5.4x** |
+| Kernel version | 29.4s | 11.4s | **2.6x** |
+| RAM query | 36.6s | 16.8s | **2.2x** |
+| Web search | 59.8s | 29.9s | **2.0x** |
+| Process list | 84.2s | 64.1s | **1.3x** |
 
 ### What Drives the Speed
 
-- **Direct-dispatch** — regex-detected intents (recall, time, math) skip LLM tool selection entirely
+- **Direct-dispatch** — 15 regex patterns skip LLM tool selection for known intents (1.6x speedup on targeted queries)
 - **Greeting fast path** — static responses for greetings, thanks, goodbyes (0.0s)
 - **66% smaller system prompt** — 811 → 279 tokens, directly reduces prefill time
 - **Grounding threshold tuning** — skip unnecessary NUC2 verification round-trips
@@ -244,22 +258,23 @@ Measured on the 3-NUC cluster with SmolLM3-3B Q4_K_M, `--threads 4`, `--flash-at
 
 ## Curriculum
 
-48 lessons across 8 modules:
+48 lessons across 9 modules:
 
 | Module | Lessons | What It Tests |
 |--------|---------|---------------|
-| Identity | 4 | Name, hardware, personality, version awareness |
+| Identity | 6 | Name, hardware, personality, greetings, opinions |
 | Core Tools | 7 | Tool fluency — shell, read_file, write_file, remember, recall, calculate |
 | Tool Selection | 6 | Picking the right tool for the job, avoiding wrong tools |
-| Multi-Tool Chains | 5 | Linking tools: system report, grep+summarize, write+verify |
+| Multi-Tool Chains | 3 | Linking tools: system report, search+remember, find+read |
 | Error Handling | 5 | Missing files, bad commands, safety blocks (sudo, rm -rf) |
 | Grounding | 5 | Current events need search, local facts from code, no fabrication |
 | Edge Cases & Nuance | 8 | Boundary conditions, ambiguous queries, refusal scenarios |
 | Response Quality | 6 | Conciseness, personality, accuracy, no raw JSON leakage |
+| Latency & Efficiency | 5 | Fast paths, single-tool sufficiency, no overthinking |
 
-**Latest result: 46/48 passed (95.8%)**
+**Latest result: 45/48 passed (93.8%)** · Best: 47/48 (97.9%)
 
-The 2 remaining failures are stochastic 3B model edge cases (identity name confusion with hostname, empty write_file content), not systematic bugs.
+The 3 remaining failures are stochastic 3B model edge cases (empty write_file content, multi-tool chain flakiness, refusal detection), not systematic bugs. Across 20 runs, no test fails deterministically — all failures are intermittent due to 3B model variance.
 
 ---
 
@@ -324,7 +339,8 @@ SmolClaw's architecture draws from published research and the Vera 2.0 codebase:
 | v0.8.0 | 2026-03 | Claim verification, safety discipline (sudo/rm blocking), 26 scenarios |
 | v0.8.1 | 2026-03 | Anti-mantra, stuckness scoring, failure discipline state machine |
 | v0.9.0 | 2026-03 | State machine dispatcher, structured I/O, smart recall, episodic memory, 26/26 = 100% |
-| **v0.9.1** | **2026-03** | **System prompt compression (66%), direct-dispatch, greeting fast path, calculate tool, expanded curriculum (48 lessons), argument aliasing, GBNF infrastructure. Overall latency 90s → 30s avg. Curriculum 46/48 (95.8%).** |
+| v0.9.1 | 2026-03 | System prompt compression (66%), direct-dispatch (5 patterns), greeting fast path, calculate tool, expanded curriculum (48 lessons), argument aliasing, GBNF infrastructure. Overall latency 90s → 30s avg. Curriculum 46/48 (95.8%). |
+| **v0.9.2** | **2026-03** | **Expanded direct-dispatch (5 → 15 patterns): web search, disk, RAM, uptime, kernel, processes, hostname, file reads. Compound query guard for multi-intent safety. 1.6x speedup on dispatch-targeted queries. File reads 5.4x faster. Curriculum 45/48 (93.8%).** |
 
 ---
 
@@ -356,10 +372,11 @@ See [ROADMAP.md](ROADMAP.md) for full details.
 - KV cache k-quantization (q4_0 vs q8_0) — no speed difference, keeping q8_0
 
 **Next up:**
+- Benchmark alternative 3B models (Llama 3.2 3B, Qwen2.5-3B, Phi-3.5-mini) for better tool-call reliability
+- LoRA fine-tuning on SmolClaw's own successful tool-call traces
 - Context compression (ACON approach) for tool output before re-injection
 - Speculative decoding with draft model
 - Web UI overhaul with cluster health monitoring
-- Fine-tuning SmolLM3 on its own successful traces (GRPO)
 
 ---
 

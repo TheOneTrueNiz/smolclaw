@@ -765,8 +765,43 @@ def scratchpad_read(name: str) -> tuple[str, bool]:
 
 # ── Flight Recorder (from Vera) ────────────────────────────────────────────
 
+import hashlib
+
+# Hash chain state for flight recorder — tamper-evident append-only ledger
+_flight_chain_prev = "0" * 64  # genesis hash
+
+def _flight_chain_init():
+    """Read last hash from existing flight recorder to resume chain."""
+    global _flight_chain_prev
+    if not FLIGHT_LOG.exists():
+        return
+    try:
+        # Read last line efficiently
+        with open(FLIGHT_LOG, "rb") as f:
+            f.seek(0, 2)  # end of file
+            size = f.tell()
+            if size == 0:
+                return
+            # Read last 4KB to find last line
+            f.seek(max(0, size - 4096))
+            lines = f.read().split(b"\n")
+            for line in reversed(lines):
+                line = line.strip()
+                if line:
+                    entry = json.loads(line)
+                    if "hash_self" in entry:
+                        _flight_chain_prev = entry["hash_self"]
+                    return
+    except Exception:
+        pass  # start fresh chain if unreadable
+
+_flight_chain_init()
+
 def flight_log(tool_name: str, tool_args: dict, result: str, is_error: bool, error_class: str = None):
-    """Log tool call + outcome to JSONL flight recorder."""
+    """Log tool call + outcome to hash-chained JSONL flight recorder.
+    Each entry contains hash_prev (previous entry's hash) and hash_self
+    (SHA-256 of the entry without hash_self). Creates a tamper-evident chain."""
+    global _flight_chain_prev
     try:
         entry = {
             "ts": datetime.now().isoformat(),
@@ -775,9 +810,14 @@ def flight_log(tool_name: str, tool_args: dict, result: str, is_error: bool, err
             "ok": not is_error,
             "result_preview": result[:200],
             "error_class": error_class,
+            "hash_prev": _flight_chain_prev,
         }
+        # Compute hash_self over the entry (without hash_self field)
+        canonical = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+        entry["hash_self"] = hashlib.sha256(canonical.encode()).hexdigest()
+        _flight_chain_prev = entry["hash_self"]
         with open(FLIGHT_LOG, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
     except Exception:
         pass  # never crash on logging
 
@@ -1866,10 +1906,19 @@ def validate_tool_args(name: str, args: dict) -> str | None:
             return f"Error: use absolute path, got '{path[:50]}'"
         if not args.get("content"):
             return "Error: empty content"
-        # Hard block: never overwrite own source, config, or harness
-        blocked = ("agent.py", "agent_hackbook.py", "test_harness.py", "web_ui.py")
-        if any(path.endswith(b) for b in blocked):
-            return f"BLOCKED: cannot overwrite critical file {path.rsplit('/', 1)[-1]}"
+        # Allowlist guard: only permitted directories can be written to
+        # Anything not explicitly allowed is denied by default
+        _WRITE_ALLOWLIST = (
+            "/tmp/",                                    # ephemeral scratch space
+            "/home/nizbot1/smolclaw/scratchpad/",       # agent scratchpad
+            "/home/nizbot1/smolclaw/scratch/",          # work area
+            "/home/nizbot1/smolclaw/work/",             # work area
+            "/home/nizbot1/smolclaw/output/",           # output area
+            "/home/nizbot1/smolclaw/memory.md",         # persistent memory (exact file)
+            "/home/nizbot1/smolclaw/conversations/",    # conversation logs
+        )
+        if not any(path.startswith(zone) or path == zone.rstrip("/") for zone in _WRITE_ALLOWLIST):
+            return f"BLOCKED: write not permitted to {path.rsplit('/', 1)[-1]} — only allowed in /tmp/, scratchpad/, work/, output/"
     elif name == "remember":
         note = args.get("note", "").strip()
         if not note:

@@ -36,7 +36,7 @@ from pathlib import Path
 LLAMA_URL = "http://100.126.137.93:8090/v1/chat/completions"       # nizbot1 — actor/planner (tailscale)
 CRITIC_URL = "http://100.104.164.38:8090/v1/chat/completions"      # nizbot2 — critic/grounding (tailscale)
 MEMORY_URL = "http://100.110.49.11:8090/v1/chat/completions"      # nizbot3 — memory/reflection (tailscale)
-GEMMA_URL = "http://192.168.4.216:8002/ask"                      # archie1 — Gemma 4 supervisor (consult)
+GEMMA_URL = os.environ.get("SMOLCLAW_GEMMA_URL", "")              # archie1 — Gemma 4 supervisor (consult)
 MODEL = "SmolLM3-Q4_K_M.gguf"
 HOME = Path(os.path.dirname(os.path.abspath(__file__)))
 MEMORY_FILE = HOME / "memory.md"
@@ -1097,6 +1097,8 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
             question = args.get("question", "").strip()
             if not question:
                 return "Error: empty question", True
+            if not GEMMA_URL:
+                return "Error: consult not configured (set SMOLCLAW_GEMMA_URL)", True
             try:
                 payload = json.dumps({"prompt": question}).encode()
                 req = urllib.request.Request(

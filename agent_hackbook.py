@@ -36,6 +36,7 @@ from pathlib import Path
 LLAMA_URL = "http://100.126.137.93:8090/v1/chat/completions"       # nizbot1 — actor/planner (tailscale)
 CRITIC_URL = "http://100.104.164.38:8090/v1/chat/completions"      # nizbot2 — critic/grounding (tailscale)
 MEMORY_URL = "http://100.110.49.11:8090/v1/chat/completions"      # nizbot3 — memory/reflection (tailscale)
+GEMMA_URL = "http://192.168.4.216:8002/ask"                      # archie1 — Gemma 4 supervisor (consult)
 MODEL = "SmolLM3-Q4_K_M.gguf"
 HOME = Path(os.path.dirname(os.path.abspath(__file__)))
 MEMORY_FILE = HOME / "memory.md"
@@ -303,6 +304,20 @@ TOOLS = [
                 "required": ["expression"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "consult",
+            "description": "Ask Gemma, a more powerful AI agent on the network, for help. Use for complex reasoning, creative writing, code review, or anything beyond your capabilities.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "What to ask Gemma"}
+                },
+                "required": ["question"]
+            }
+        }
     }
 ]
 
@@ -330,6 +345,9 @@ _TOOL_KEYWORDS = {
     "calculate": {"calculate", "math", "times", "plus", "minus", "divide", "divided",
                   "multiply", "sum", "total", "average", "percent", "square root",
                   "power", "convert", "how much is"},
+    "consult": {"consult", "ask gemma", "gemma", "help me", "complex", "review",
+                "code review", "analyze this", "second opinion", "bigger model",
+                "smarter", "another ai", "other agent"},
 }
 
 _TOOL_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
@@ -378,7 +396,8 @@ SYSTEM_PROMPT = f"""/no_think
 My name is SmolClaw. I am an autonomous AI agent on this Intel NUC.
 Today: {datetime.now().strftime("%Y-%m-%d %H:%M")} | Host: {os.uname().nodename} | Home: {HOME} | User: nizbot1 (no sudo)
 
-Tools: shell, read_file, write_file, remember, recall, scratchpad, web_search, calculate.
+Tools: shell, read_file, write_file, remember, recall, scratchpad, web_search, calculate, consult.
+I can consult Gemma (a powerful AI on the network) for complex reasoning, code review, or when I need a second opinion.
 Tool format — ALWAYS use <tool_call> tags:
 <tool_call>
 {{"name": "shell", "arguments": {{"command": "uptime"}}}}
@@ -429,6 +448,10 @@ FEW_SHOT_EXAMPLES = {
     "calculate": (
         "What is 15 times 23?",
         '<tool_call>\n{"name": "calculate", "arguments": {"expression": "15 * 23"}}\n</tool_call>',
+    ),
+    "consult": (
+        "Ask Gemma to review this approach for me.",
+        '<tool_call>\n{"name": "consult", "arguments": {"question": "Is this approach correct for handling concurrent requests?"}}\n</tool_call>',
     ),
 }
 
@@ -1070,6 +1093,25 @@ def execute_tool(name: str, args: dict) -> tuple[str, bool]:
             except Exception as e:
                 return f"Math error: {e}", True
 
+        elif name == "consult":
+            question = args.get("question", "").strip()
+            if not question:
+                return "Error: empty question", True
+            try:
+                payload = json.dumps({"prompt": question}).encode()
+                req = urllib.request.Request(
+                    GEMMA_URL, data=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = json.loads(resp.read())
+                answer = data.get("response", "")
+                # Strip the identity glyph prefix for cleaner integration
+                answer = re.sub(r'^\[.*?ξ:\d+\.\d+\]\s*', '', answer)
+                return f"[Gemma says]: {answer}", False
+            except Exception as e:
+                return f"Error consulting Gemma: {e}", True
+
         else:
             return f"Unknown tool: {name}", True
 
@@ -1338,7 +1380,7 @@ def needs_grounding(synthesis: str, had_tool_results: bool,
     # ── Fast-path: tool-backed answers skip grounding entirely ──
     # If the agent used data-producing tools, the synthesis is
     # summarising their output — nothing to hallucinate.
-    DATA_TOOLS = {"shell", "read_file", "scratchpad", "web_search", "recall", "calculate"}
+    DATA_TOOLS = {"shell", "read_file", "scratchpad", "web_search", "recall", "calculate", "consult"}
     if had_tool_results and tools_used:
         if tools_used & DATA_TOOLS:
             print(f"  [grounding] skipped — answer backed by tool output ({tools_used & DATA_TOOLS})")
@@ -1940,6 +1982,12 @@ def validate_tool_args(name: str, args: dict) -> str | None:
             return "Error: empty expression"
         if len(expr) > 200:
             return "Error: expression too long"
+    elif name == "consult":
+        question = args.get("question", "").strip()
+        if not question:
+            return "Error: empty question"
+        if len(question) > 500:
+            return "Error: question too long (>500 chars). Be concise."
     return None
 
 
@@ -2154,7 +2202,7 @@ def critic_check(tool_call: dict, user_request: str) -> tuple[str, str]:
 
 # Tools that are unconditionally safe — skip critic to save 3-10s
 # remember is safe here because it has its own verify_memory_write() gate on NUC2
-SAFE_TOOLS = {"recall", "scratchpad", "web_search", "remember", "calculate"}
+SAFE_TOOLS = {"recall", "scratchpad", "web_search", "remember", "calculate", "consult"}
 SAFE_SHELL_PREFIXES = (
     "uptime", "df ", "df\n", "free ", "free\n", "uname ", "whoami", "hostname",
     "date", "cat ", "ls ", "ls\n", "head ", "tail ", "wc ", "du ", "ps ", "ps\n",

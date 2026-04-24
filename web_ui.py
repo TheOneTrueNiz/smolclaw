@@ -344,6 +344,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # Trigger background summarization (non-blocking)
                     _trigger_background_summary(cid)
 
+        elif self.path == '/ask':
+            # Gemma-compatible endpoint: POST {"prompt": "..."} → {"response": "...", "thoughts": [...]}
+            body = self._body()
+            prompt = body.get('prompt', '').strip()
+            if not prompt:
+                self._json({"error": "empty prompt"}, 400)
+                return
+            with _agent_lock:
+                _agent_status["running"] = True
+                _agent_status["query"] = f"[ask] {prompt[:60]}"
+                try:
+                    print(f"[ask] query: {prompt[:80]}")
+                    response = run_agent_aot(prompt, history=[], on_token=None)
+                    print(f"[ask] response: {response[:80]}")
+                finally:
+                    _agent_status["running"] = False
+                    _agent_status["query"] = ""
+            self._json({"response": response, "thoughts": []})
+
         elif self.path == '/api/conversations':
             self._json(create_conversation())
 

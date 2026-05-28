@@ -1193,6 +1193,18 @@ def gather_partial_results(messages: list) -> str:
         return "Partial results before I hit too many errors:\n" + "\n---\n".join(partials)
     return "I hit too many errors in a row and stopped to avoid spiraling. The task may need a different approach."
 
+
+def best_stall_result(ctx) -> str:
+    """Pick the best fallback when stalling: streamed pending_synthesis if we
+    have one, else tool-result digest. Prevents the UI from replacing a
+    coherent live-streamed answer with the generic 'Partial results...' string."""
+    if ctx.pending_synthesis:
+        clean = re.sub(r'<think>.*?</think>', '', ctx.pending_synthesis, flags=re.DOTALL).strip()
+        clean = re.sub(r'<tool_call>.*?</tool_call>', '', clean, flags=re.DOTALL).strip()
+        if clean:
+            return _trim_to_last_sentence(clean)
+    return gather_partial_results(ctx.messages)
+
 # ── Tool Output Verification (from Vera) ──────────────────────────────────
 # Detect prompt injection in tool outputs before feeding to the model.
 
@@ -2656,6 +2668,9 @@ def _sm_init(ctx: TaskContext) -> str:
         ]
         ctx.pending_content = ""
         ctx.turns_used = 1
+        # Multi-tool report needs headroom — the default budget truncates
+        # mid-line and the continuation trips the repetition detector.
+        ctx.synthesis_budget = 384
         return "CRITIC_CHECK"
 
     # -- Memory: recall --
@@ -2862,7 +2877,7 @@ def _sm_select_tool(ctx: TaskContext) -> str:
         print(f"  [REPETITION] model repeating itself")
         flight_log("repetition_break", {}, content[:100], True)
         ctx.terminal_state = TERMINAL_STALLED
-        ctx.result = gather_partial_results(ctx.messages)
+        ctx.result = best_stall_result(ctx)
         if not ctx.result:
             ctx.result = "(I got stuck repeating myself. The task may need a different approach.)"
         return "DONE"
@@ -2872,7 +2887,7 @@ def _sm_select_tool(ctx: TaskContext) -> str:
         print(f"  [STALLED] score={ctx.progress.stuckness_score:.1f}")
         flight_log("stalled", {}, f"score={ctx.progress.stuckness_score}", True)
         ctx.terminal_state = TERMINAL_STALLED
-        ctx.result = gather_partial_results(ctx.messages)
+        ctx.result = best_stall_result(ctx)
         return "DONE"
 
     # Parse tool calls from model output

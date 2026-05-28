@@ -77,6 +77,18 @@ _COMPLEX_PATTERNS = re.compile(
     r'pros.and.cons|what are the|tell me about|help me understand)\b',
     re.IGNORECASE,
 )
+# Narration patterns — model described what it would do instead of doing it.
+# When a synthesis matches these AND no tools actually ran, the gate retries.
+_NARRATION_PATTERNS = re.compile(
+    r"(?:^|[.\s])(?:"
+    r"I[' ]?ll\s+(?:run|check|use|call|consult|search|read|execute|verify|start\s+by|try)|"
+    r"I[' ]?m\s+(?:running|checking|using|calling|attempting|consulting|searching|going\s+to|about\s+to)|"
+    r"I\s+would\s+(?:use|call|run|check)|"
+    r"Let\s+me\s+(?:use|call|run|check|consult|try)|"
+    r"I[' ]?ll\s+(?:verify|consult\s+Gemma|perform|inspect)"
+    r")\b",
+    re.IGNORECASE,
+)
 
 def classify_synthesis_budget(query: str) -> int:
     """Return synthesis token budget based on query complexity.
@@ -2427,6 +2439,7 @@ class TaskContext:
         'reflections_used', 'max_reflections', 'tether_injected', 'tool_nudge_used',
         'pending_calls', 'pending_content', 'approved_calls', 'pending_synthesis',
         '_continued', 'on_token', 'synthesis_budget', 'forced_tools',
+        '_synthesis_retried',
     ]
 
     def __init__(self, user_message: str, history: list = None):
@@ -2461,6 +2474,7 @@ class TaskContext:
         self.on_token = None
         self.synthesis_budget = classify_synthesis_budget(user_message)
         self.forced_tools: set[str] = set()  # tools forced by pre-nudge
+        self._synthesis_retried = False
 
     def available_tools(self) -> list[dict]:
         """Return tools filtered by relevance + cooldowns. Shrinks prompt."""
@@ -2617,6 +2631,33 @@ def _sm_init(ctx: TaskContext) -> str:
                          r'\buptime\b', r'\bprocess\b|\bcpu\b']
             if re.search(p, _gl)) >= 2
     )
+
+    # -- Self-test: meta-prompt asking Smols to exercise his tools --
+    # Queues a real battery (shell uptime, calculate, recall) so the model
+    # synthesizes a grounded report instead of narrating "I'll use the X tool".
+    if re.search(
+        r'(test\s+your\s+tool|exercise\s+your\s+tool|work\s+through\s+your\s+tool|'
+        r'demo\s+your\s+tool|demonstrate\s+your\s+tool|use\s+your\s+tool|'
+        r'show\s+me\s+what\s+you\s+can\s+do|what\s+(tools|can)\s+you\s+(have|do)|'
+        r'try\s+(out\s+)?your\s+tool|prove\s+(you\s+can|your\s+tool))',
+        _gl,
+    ):
+        print(f"  [direct-dispatch] self-test battery")
+        # Rewrite the user message to a directive so synthesis reports
+        # the tool outputs instead of riffing on the recall memory.
+        ctx.messages[-1] = {"role": "user", "content": (
+            "Run a self-test of your tools, then give me a short report. "
+            "For each tool, write one line: <tool_name>: <one-sentence summary of its output>. "
+            "Stick to what the tools returned — no opinions, no extra commentary."
+        )}
+        ctx.pending_calls = [
+            {"name": "shell", "arguments": {"command": "uptime"}},
+            {"name": "calculate", "arguments": {"expression": "2+2"}},
+            {"name": "recall", "arguments": {}},
+        ]
+        ctx.pending_content = ""
+        ctx.turns_used = 1
+        return "CRITIC_CHECK"
 
     # -- Memory: recall --
     if re.search(r'(you remember|do you recall|what do you know about|did i tell you|i told you|i mentioned|earlier.*about|what.*favorite|what.*my\s+(name|birthday|email|phone|age|preference|address\b))', _gl):
@@ -2848,7 +2889,10 @@ def _sm_select_tool(ctx: TaskContext) -> str:
                 and re.search(r'\b(check|verify|confirm|run:|grep |what\b.*\b(model|version|population)|'
                               r'you remember|do you recall|what do you know|'
                               r'did i tell|i told you|i mentioned|earlier.*about|'
-                              r'what\b.*\b(files?|disk|uptime|memory usage|process))\b',
+                              r'what\b.*\b(files?|disk|uptime|memory usage|process)|'
+                              r'test\s+your|demonstrate|show\s+me\s+(your|what\s+you)|'
+                              r'use\s+your\s+tool|try\s+your\s+tool|exercise\s+your|'
+                              r'work\s+through\s+your\s+tool|prove\s+you\s+can)\b',
                               ctx.goal.lower())):
             ctx.tool_nudge_used = True
             nudge = ("[TOOL REQUIRED] You must use a tool to answer this — do not answer from memory. "
@@ -3132,9 +3176,14 @@ def _sm_synthesize(ctx: TaskContext) -> str:
             print(f"  [trim] cleaned truncated response ({len(clean)} → {len(trimmed)} chars)")
             clean = trimmed
 
+    # ── Anti-narration gate ──
+    # Model described tools instead of calling them. Skip claim verify
+    # (expensive LLM call to NUC2) and retry with a hard tool nudge.
+    is_narration = bool(_NARRATION_PATTERNS.search(clean)) and not ctx.has_tool_results
+
     # ── Claim Decomposition (replaces grounding + contradiction) ──
     verdict_info = None
-    if needs_grounding(clean, ctx.has_tool_results, ctx.tools_used):
+    if not is_narration and needs_grounding(clean, ctx.has_tool_results, ctx.tools_used):
         print(f"  [verify] extracting claims...")
         claims = extract_claims(clean)
         if claims:
@@ -3144,6 +3193,32 @@ def _sm_synthesize(ctx: TaskContext) -> str:
             # No claims extracted — fall back to legacy grounding
             print(f"  [verify] no claims found — legacy grounding")
             clean = grounding_check(clean, ctx.goal)
+
+    # ── Synthesis gate: retry once when response is ungrounded ──
+    # Triggers: (a) narration-without-tools, or (b) majority claims unsupported
+    # AND no tools ran. Bounded — one retry only, gated by _synthesis_retried.
+    mostly_unsupported = (
+        verdict_info
+        and not ctx.has_tool_results
+        and verdict_info["unsupported"] > verdict_info["total"] // 2
+    )
+    if (is_narration or mostly_unsupported) and not ctx._synthesis_retried:
+        ctx._synthesis_retried = True
+        reason = "narration" if is_narration else "unsupported"
+        print(f"  [gate] {reason} without tools — retrying with hard nudge")
+        flight_log("synthesis_gate", {"reason": reason}, clean[:200], True)
+        ctx.messages.append({"role": "assistant", "content": ctx.pending_synthesis})
+        ctx.messages.append({"role": "user", "content": (
+            "[TOOL REQUIRED] You described tools instead of calling them. "
+            "Pick ONE tool that fits the task and emit a <tool_call> block now. "
+            "No lists. No narration. Just the tool call."
+        )})
+        ctx.pending_synthesis = ""
+        ctx._continued = False
+        # Budget guard — give at least one more turn even if we hit the cap
+        if ctx.turns_used >= ctx.budget:
+            ctx.budget = ctx.turns_used + 2
+        return "SELECT_TOOL"
 
     ctx.result = clean
 

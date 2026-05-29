@@ -120,13 +120,14 @@ ws ::= [ \t\n]*"""
 
 # Argument key aliases — grammar may produce slightly different key names
 _ARG_ALIASES = {
-    "content": "note",       # remember tool: grammar sometimes says "content"
-    "file_path": "path",     # read_file/write_file: grammar sometimes says "file_path"
-    "file": "path",          # same
-    "search": "query",       # web_search: grammar sometimes says "search"
-    "cmd": "command",        # shell: grammar sometimes says "cmd"
-    "expr": "expression",    # calculate: grammar sometimes says "expr"
-    "text": "note",          # remember tool
+    # Per-tool alias maps. Global aliases were a footgun: "content"->"note"
+    # nuked write_file's content arg, which legitimately expects "content".
+    "remember": {"content": "note", "text": "note"},
+    "read_file": {"file_path": "path", "file": "path"},
+    "write_file": {"file_path": "path", "file": "path"},
+    "web_search": {"search": "query"},
+    "shell": {"cmd": "command"},
+    "calculate": {"expr": "expression"},
 }
 
 # ── Persistent HTTP connections (keep-alive) ──────────────────────────────
@@ -2451,7 +2452,7 @@ class TaskContext:
         'reflections_used', 'max_reflections', 'tether_injected', 'tool_nudge_used',
         'pending_calls', 'pending_content', 'approved_calls', 'pending_synthesis',
         '_continued', 'on_token', 'synthesis_budget', 'forced_tools',
-        '_synthesis_retried',
+        '_synthesis_retried', '_self_test_mode',
     ]
 
     def __init__(self, user_message: str, history: list = None):
@@ -2487,6 +2488,7 @@ class TaskContext:
         self.synthesis_budget = classify_synthesis_budget(user_message)
         self.forced_tools: set[str] = set()  # tools forced by pre-nudge
         self._synthesis_retried = False
+        self._self_test_mode = False
 
     def available_tools(self) -> list[dict]:
         """Return tools filtered by relevance + cooldowns. Shrinks prompt."""
@@ -2647,14 +2649,18 @@ def _sm_init(ctx: TaskContext) -> str:
     # -- Self-test: meta-prompt asking Smols to exercise his tools --
     # Queues a real battery (shell uptime, calculate, recall) so the model
     # synthesizes a grounded report instead of narrating "I'll use the X tool".
+    # Allow optional adjectives between "your" and "tool" — "test your full tool set",
+    # "exercise your complete toolbox", "demo your entire tool kit", etc.
+    _your_tool = r"your\s+(?:full|complete|entire|whole|all|each|every|new)?\s*tool"
     if re.search(
-        r'(test\s+your\s+tool|exercise\s+your\s+tool|work\s+through\s+your\s+tool|'
-        r'demo\s+your\s+tool|demonstrate\s+your\s+tool|use\s+your\s+tool|'
-        r'show\s+me\s+what\s+you\s+can\s+do|what\s+(tools|can)\s+you\s+(have|do)|'
-        r'try\s+(out\s+)?your\s+tool|prove\s+(you\s+can|your\s+tool))',
+        rf'(test\s+{_your_tool}|exercise\s+{_your_tool}|work\s+through\s+{_your_tool}|'
+        rf'demo\s+{_your_tool}|demonstrate\s+{_your_tool}|use\s+{_your_tool}|'
+        rf'try\s+(?:out\s+)?{_your_tool}|prove\s+{_your_tool}|run.*self[- ]test|'
+        r'show\s+me\s+what\s+you\s+can\s+do|what\s+(?:tools|can)\s+you\s+(?:have|do)|'
+        r'prove\s+you\s+can|self[- ]test\s+your)',
         _gl,
     ):
-        print(f"  [direct-dispatch] self-test battery")
+        print(f"  [direct-dispatch] self-test battery (full tour)")
         # Rewrite the user message to a directive so synthesis reports
         # the tool outputs instead of riffing on the recall memory.
         ctx.messages[-1] = {"role": "user", "content": (
@@ -2662,16 +2668,34 @@ def _sm_init(ctx: TaskContext) -> str:
             "For each tool, write one line: <tool_name>: <one-sentence summary of its output>. "
             "Stick to what the tools returned — no opinions, no extra commentary."
         )}
+        # Full tour: exercises every tool with bounded, low-risk inputs.
+        # The two-step shell→scratchpad demonstrates auto-stash and read-back.
+        _today = datetime.now().strftime("%Y-%m-%d")
         ctx.pending_calls = [
             {"name": "shell", "arguments": {"command": "uptime"}},
+            {"name": "shell", "arguments": {"command": "ls /usr/bin"}},
+            {"name": "scratchpad", "arguments": {"name": "ls"}},
             {"name": "calculate", "arguments": {"expression": "2+2"}},
+            {"name": "read_file", "arguments": {"path": "/etc/hostname"}},
+            {"name": "write_file", "arguments": {
+                "path": "/tmp/smolclaw_self_test.txt",
+                "content": f"self-test ok ({_today})",
+            }},
+            {"name": "remember", "arguments": {"note": f"Self-test ran on {_today}."}},
             {"name": "recall", "arguments": {}},
+            {"name": "web_search", "arguments": {"query": "SmolClaw"}},
         ]
+        # Consult is only included when the Gemma URL is configured —
+        # otherwise the tool returns an error string and pollutes the report.
+        if os.environ.get("SMOLCLAW_GEMMA_URL"):
+            ctx.pending_calls.append({"name": "consult", "arguments": {
+                "question": "Are you reachable? Reply briefly so SmolClaw can verify the bridge.",
+            }})
         ctx.pending_content = ""
         ctx.turns_used = 1
-        # Multi-tool report needs headroom — the default budget truncates
-        # mid-line and the continuation trips the repetition detector.
-        ctx.synthesis_budget = 384
+        # Full battery needs enough headroom for one-line-per-tool summaries.
+        ctx.synthesis_budget = 512
+        ctx._self_test_mode = True
         return "CRITIC_CHECK"
 
     # -- Memory: recall --
@@ -3002,9 +3026,10 @@ def _sm_execute(ctx: TaskContext) -> str:
 
         # ── Normalize argument keys via aliases (GBNF may produce variants) ──
         if args:
+            aliases = _ARG_ALIASES.get(name, {})
             normalized = {}
             for k, v in args.items():
-                normalized[_ARG_ALIASES.get(k, k)] = v
+                normalized[aliases.get(k, k)] = v
             args = normalized
             call["arguments"] = args
 
@@ -3142,6 +3167,19 @@ def _sm_execute(ctx: TaskContext) -> str:
         ctx.terminal_state = TERMINAL_STALLED
         ctx.result = gather_partial_results(ctx.messages)
         return "DONE"
+
+    # ── Self-test format reminder ──
+    # After the full battery executes, inject a final user message right
+    # before synthesis so the model summarizes each tool line-by-line
+    # instead of regurgitating raw JSON of one tool's result.
+    if ctx._self_test_mode:
+        ctx.messages.append({"role": "user", "content": (
+            "All tools have run. Write the report now. Exactly one line per tool, "
+            "in this format: <tool_name>: <one short sentence summarizing what it returned>. "
+            "Do NOT quote raw JSON. Do NOT paste tool output verbatim. Do NOT add commentary. "
+            "Just the lines."
+        )})
+        ctx._self_test_mode = False  # fire only once
 
     return "SELECT_TOOL"
 
